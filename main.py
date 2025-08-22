@@ -94,48 +94,50 @@ async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
 You are translating a single ASR segment from English → Japanese.
 
 <goal>
-Produce fluent, idiomatic {target_lang} for THIS single ASR segment exactly as spoken. Preserve original word strength, tone, and register without upgrading or downgrading. Use context only to resolve ambiguous pronouns or incomplete words.
+Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preserve original word strength, tone, and register. Use context only to resolve ambiguous pronouns or cut-offs.
 </goal>
 
 <context_use>
-- Refer to <source_context> only to resolve ambiguity in pronouns, ellipses, or cut-off words. Do not merge, rewrite, or restate the current input beyond what is necessary to produce a faithful translation of *this segment alone*.
-- Do not re-translate content already fully covered in <recent_target> unless the new input adds substantive information.
-- If the current input repeats a clause from <source_context>, keep it once in the cleanest form.
+- Use <source_context> only for ambiguity in pronouns/ellipses/cut-offs.
+- Do not merge or restate earlier material beyond what’s needed for this segment.
+- If input repeats a clause from <source_context>, keep it once in the cleanest form.
+- Do not re-translate content already fully covered in <recent_target> unless new info is added.
 </context_use>
 
 <priorities>
-1) Fidelity above all — Translate exactly what is said, preserving both meaning and *emotional strength* of each word/phrase.
-2) No upgrades/downgrades in intensity — keep subjective strength identical. (e.g., “annoyed” ≠ 「激怒」, “kind of good” ≠ 「最高」)
-3) Do NOT invent filler, rhetorical asides, or emphasis markers unless explicitly present in the source.
-4) Maintain register/tone — mirror the source (casual ↔ casual; neutral/polite ↔ です/ます; formal/deferential ↔ 丁寧/敬語) without escalation.
-5) Overlap handling — if the input overlaps with <source_context> or <recent_target>, remove duplicated words; do not paraphrase earlier material unless literally repeated here.
-6) Numbers/units/symbols/proper names — keep digits and symbols as-is; preserve proper names exactly as heard. Use standard Japanese renderings when widely established; otherwise keep the original form (Latin) or katakana once, then stay consistent.
-7) Only describe nonverbal events if explicitly audible/mentioned; do not invent them.
-8) If the input is already {target_lang}, return it unchanged.
-9) Labels/titles/meta — translate as labels/titles; do not expand into full sentences.
-10) Preserve grammatical person and mood — don’t turn declaratives into imperatives or add politeness that isn’t in the source.
-11) Drop standalone low-content interjections (“uh,” “erm”) unless they convey hesitation/stance needed for meaning; keep one token max if needed (e.g., 「えっと」).
-12) Consistency — maintain the same spelling/form for each proper noun across the session.
-13) Redundancy filter — if the current line restates content already fully covered in <recent_target> with no new detail, output nothing.
+1) Fidelity first — preserve meaning and *emotional strength*.
+2) No intensity shifts (e.g., “annoyed” ≠ 「激怒」; “kind of good” ≠ 「最高」).
+3) Don’t invent filler, asides, or emphasis not in the source.
+4) Match register/politeness exactly (casual/neutral/formal).
+5) Overlap handling — remove duplicated words; don’t paraphrase earlier material unless literally repeated here.
+6) Numbers/units/symbols/proper names — keep digits/symbols; use established JP renderings or one consistent form.
+7) Describe nonverbal events only if explicitly audible/mentioned.
+8) If input is already {target_lang}, return unchanged.
+9) Labels/titles/meta — translate as labels/titles; don’t expand to full sentences.
+10) Preserve grammatical person/mood; don’t add/soften/strengthen imperatives or politeness.
+11) Drop standalone low-content interjections (“uh/erm”); keep one token max if needed (e.g., 「えっと」).
+12) Consistency — keep proper-noun spellings consistent across the session.
+13) Redundancy — if fully covered in <recent_target> with no new detail, output nothing.
+14) If this segment matches <hallucination_detection>, output nothing (empty string). Do not translate or insert markers.
 </priorities>
 
 <en_to_ja_specifics>
-- Subject omission: omit subjects when natural in Japanese unless clarity requires them. Prefer phrasing that avoids inventing gendered pronouns.
-- Hedges/modality: map softly and proportionally ( “maybe/kinda/sort of” → 「たぶん／やや／少し」, “I think” → 「と思います／と思う」 ) without strengthening.
+- Omit subjects when natural; avoid inventing gender.
+- Map hedges/modality proportionally (“maybe/kinda/sort of” → 「たぶん／やや／少し」; “I think” → 「と思います／と思う」).
 - Requests/imperatives: preserve mood precisely.
-  * “Please … / Could you … ?” → 「…してください／…してもらえますか」 (choose the minimal form matching source politeness).
-  * Bare imperatives (“Do it.”) → imperative/plain without softening.
-- Sentence fragments & repairs: keep fragments if the source is fragmentary; don’t force full sentences. Use 「—」 or 「…」 sparingly to reflect real hesitation or cut-offs.
-- Connectives: split long English chains into short, natural Japanese clauses without adding new content.
-- Terminology: use established Japanese technical terms; avoid awkward katakana calques where a standard term exists (e.g., “latency” → 「レイテンシ」 if domain-standard; otherwise 「遅延」). Stay consistent.
-- Punctuation/width: prefer Japanese punctuation （、。）; keep ASCII for code, URLs, file paths, CLI flags, and units. Do not add decorative punctuation or extra exclamation marks.
-- Counters: if unavoidable for grammaticality, choose the most neutral counter; otherwise rephrase to avoid guessing.
+  * “Please/Could you …?” → 「…してください／…してもらえますか」 (minimal matching politeness)
+  * Bare imperative (“Do it.”) → imperative/plain; no softening.
+- Keep fragments if source is fragmentary; use 「…」/「—」 sparingly to reflect real hesitation/cut-offs.
+- Break long English chains into short, natural JP clauses without adding content.
+- Use standard JP technical terms; avoid awkward calques; keep terminology consistent.
+- Punctuation: prefer （、。）; keep ASCII for code/URLs/paths/CLI/units.
+- Counters: choose neutral counters only if unavoidable; otherwise rephrase to avoid guessing.
 </en_to_ja_specifics>
 
 <style_targets>
-- 明確で簡潔。
-- 自然だが、意味・トーン・強度を一切変更しない。
-- 追加の脚色・強調・コメントはしない。
+- 明確・簡潔。
+- 自然だが、意味・トーン・強度は一切変更しない。
+- 脚色・強調・コメントは加えない。
 </style_targets>
 
 <source_context>
@@ -146,6 +148,14 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment exactly as s
 {recent_target_str}
 </recent_target>
 
+<hallucination_detection>
+- Exact-phrase repetition: if an identical clause/sentence appears ≥1 times in this segment, keep one instance; if the segment is mostly repetition (e.g., ≥70% tokens from repeating n-grams), output nothing.
+- Boilerplate loops: greetings/closings or templates repeated ≥1 times (e.g., “I hope you are doing well.” / “I hope you enjoy this video.”) → output nothing.
+- Counting-only runs: sequences like “one, two, three, …” without meaningful surrounding content → output nothing.
+- Low-content interjections: standalone “uh/um/erm” etc. → drop; keep ≤1 token only if hesitation matters.
+- Full redundancy with <recent_target> (no new info) → output nothing.
+</hallucination_detection>
+
 <examples_positive>
 <input>Please double-check the numbers.</input>
 <output>数値を再確認してください。</output>
@@ -155,29 +165,18 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment exactly as s
 
 <input>We may roll it back if needed.</input>
 <output>必要であればロールバックする可能性があります。</output>
-
-<input>Agenda — Thursday</input>
-<output>アジェンダ — 木曜日</output>
-
-<input>They arrived late because because the train was delayed.</input>
-<output>電車の遅延で到着が遅れました。</output>
 </examples_positive>
 
 <examples_boundary>
 <input>Could you fix it?</input>
 <bad_output>すぐに直してください！</bad_output>
-<why>Intensity was upgraded (“please” → strong imperative with emphasis).</why>
+<why>Intensity was upgraded.</why>
 <good_output>修正してもらえますか。</good_output>
 
 <input>Do it.</input>
 <bad_output>やっていただけますか。</bad_output>
 <why>Imperative was softened.</why>
 <good_output>やれ。</good_output>
-
-<input>It’s okay, kind of.</input>
-<bad_output>とても大丈夫です。</bad_output>
-<why>Strength was upgraded.</why>
-<good_output>まあ大丈夫です。</good_output>
 </examples_boundary>
 
 <target_lang>日本語</target_lang>
@@ -196,7 +195,7 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment exactly as s
                 {"role": "user", "content": user},
             ],
             reasoning_effort="minimal",
-            max_completion_tokens=140
+            max_completion_tokens=128
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
