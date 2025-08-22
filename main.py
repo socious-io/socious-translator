@@ -342,15 +342,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     result = model.transcribe(
                         wav.name,
                         fp16=True,
-                        temperature=(0.0, 0.2, 0.4, 0.6),
-                        best_of=5,
-                        beam_size=None,
+                        temperature=0.0
+                        beam_size=5,
                         condition_on_previous_text=False,
                         hallucination_silence_threshold=0.30,
-                        no_speech_threshold=0.85,
+                        no_speech_threshold=0.6,
                         language="en" if source_lang == "English" else "ja",
-                        compression_ratio_threshold=2.0,
-                        logprob_threshold=-1.2,
+                        compression_ratio_threshold=1.8,
+                        logprob_threshold=-0.4,
                         task=whisper_task,
                     )
 
