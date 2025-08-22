@@ -41,8 +41,19 @@ MAX_RECENT = 10
 
 # exact short interjections only (and standalone "you")
 THANKS_RE = re.compile(
-    r'^\s*(?:thank\s*you|thank\s*you\s*so\s*much|thanks|thx|you)\s*[!.…]*\s*$',
-    re.IGNORECASE
+    r"""
+    ^\s*
+    (?:
+        (?:thank\s*(?:you|u)|thanks|thanx|thx|tks|ty|tysm|tyvm|
+         many\s*thanks|much\s*thanks|much\s*appreciated|appreciate\s*it|
+         cheers|ta|nice\s*one)
+        (?:\s*(?:so\s*much|very\s*much|a\s*lot|
+            everyone|everybody|all|y['’]?all|guys|folks|team))?
+        |you
+    )
+    \s*[!.…😊🙏💖✨👏👍]*\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 def is_interjection_thanks(text: str) -> bool:
@@ -50,40 +61,143 @@ def is_interjection_thanks(text: str) -> bool:
         return False
     return bool(THANKS_RE.match(text.strip()))
 
+
+# Broad CTA / meta filler (intros, outros, like/subscribe, links, comments, follows, sponsors, merch, goals)
 _CTA_PATTERNS = [
-    r'(?i)\blike\s*(?:and\s*)?subscribe\b',
-    r'(?i)\bsubscribe\s*(?:and\s*)?like\b',
-    r'(?i)\bshare\s+(?:this|the)\s+(?:video|stream|clip|content)\b',
-    r'(?i)\bplease\s+share\b',
-    r'(?i)\bhit\s+(?:the\s+)?bell\b',
-    r'(?i)\bturn\s+on\s+notifications?\b',
-    r'(?i)\bdon\'?t\s+forget\s+to\s+turn\s+on\s+notifications?\b',
-    r'(?i)\blink\s+in\s+(?:the\s+)?(?:bio|description)\b',
-    r'(?i)\bcheck\s+(?:the\s+)?link\s+(?:below|above)\b',
-    r'(?i)\bsee\s+you\s+(?:next\s*time|tomorrow|soon|in\s+the\s+next)\b',
-    r'(?i)\bthanks?\s+for\s+watching\b',
-    r'(?i)\bthank\s+you\s+for\s+watching\b',
-    r'(?i)\bthank\s+you\s+so\s+much\s+for\s+watching\b',
-    r"(?i)\bthank\s+you\s+y['’]?all\b",
-    r"(?i)\bthanks?\s+y['’]?all\b",
-    r'(?i)\bthat\'?s\s+(?:it|all)\s+for\s+(?:today|now)\b',
-    r'(?i)\bthat\'?s\s+(?:it|all)\b',
-    r'(?i)\bsmash\s+(?:that\s+)?like\b',
-    r'(?i)\bsubtitles?\s+by\b',
-    r'(?i)\bcaptions?\s+by\b',
-    r'(?i)\bsubtitled\s+by\b',
-    r'(?i)\bclosed\s+captions?\s+by\b',
-    r'(?i)\bamara\.org\b',
-    r'(?i)\btranscription\s+by\b'
+    # --- Intros / greetings (channel meta) ---
+    r"(?i)^\s*(?:hey|hi|hello|what'?s\s*up|yo|good\s+(?:morning|afternoon|evening))\s+(?:guys|everyone|everybody|folks|y['’]?all|friends)\b",
+    r"(?i)\bwelcome\s+(?:back\s+)?to\s+my\s+channel\b",
+    r"(?i)\bwelcome\s+(?:back\s+)?(?:everyone|guys|y['’]?all|friends)\b",
+    r"(?i)\bthanks?\s+for\s+joining\s+(?:me|us)\b",
+
+    # --- Like / comment / subscribe combos ---
+    r"(?i)\blike\s*(?:,?\s*comment\s*)?(?:,?\s*and\s*)?subscribe\b",
+    r"(?i)\bsubscribe\s*(?:,?\s*and\s*)?(?:like|comment)\b",
+    r"(?i)\b(?:like|comment|subscribe)\b(?:\s*[,&/]\s*\b(?:like|comment|subscribe)\b){1,2}",
+    r"(?i)\b(?:drop|leave|smash|hit|press|tap)\s+(?:the\s+)?like\b",
+    r"(?i)\bgive\s+(?:it\s+)?a\s+thumbs?\s*up\b",
+    r"(?i)\bdrop\s+a\s+like\b",
+    r"(?i)\bsubscribe\s+(?:for|to)\s+more\b",
+    r"(?i)\bsubscribe\s+now\b",
+    r"(?i)\bhelp\s+(?:the\s+)?channel\s+by\s+(?:liking|subscribing)\b",
+
+    # --- Notifications ---
+    r"(?i)\b(?:ring|hit|tap|click)\s+(?:the\s+)?(?:notification\s+)?bell\b",
+    r"(?i)\bturn\s+on\s+(?:the\s+)?notifications?\b",
+    r"(?i)\benable\s+(?:post\s+)?notifications?\b",
+    r"(?i)\bdon'?t\s+forget\s+(?:to\s+)?(?:like|comment|share|subscribe|turn\s+on\s+notifications?)\b",
+
+    # --- Share / links / description ---
+    r"(?i)\bshare\s+(?:this|the)\s+(?:video|stream|clip|content|tutorial)\b",
+    r"(?i)\bplease\s+share\b",
+    r"(?i)\b(?:link|links?)\s+in\s+(?:the\s+)?(?:bio|description|comments?)\b",
+    r"(?i)\bcheck\s+(?:the\s+)?link\s+(?:below|above)\b",
+    r"(?i)\bmore\s+info\s+in\s+(?:the\s+)?description\b",
+
+    # --- Comment prompts ---
+    r"(?i)\b(?:leave|drop|post)\s+(?:a|your)?\s*comment[s]?\b",
+    r"(?i)\bcomment\s+(?:below|down\s+below)\b",
+    r"(?i)\btell\s+me\s+in\s+the\s+comments?\b",
+    r"(?i)\bwhat\s+do\s+you\s+think\s+in\s+the\s+comments?\b",
+
+    # --- Outros / closings ---
+    r"(?i)\bthanks?\s+for\s+(?:watching|tuning\s+in|coming\s+by|listening)\b",
+    r"(?i)\bthank\s+you\s+for\s+(?:watching|tuning\s+in|coming\s+by|listening)\b",
+    r"(?i)\bsee\s+you\s+(?:next\s*time|tomorrow|soon|in\s+the\s+next(?:\s+one|video)?)\b",
+    r"(?i)\bthat'?s\s+(?:it|all)(?:\s+for\s+(?:today|now))?\b",
+    r"(?i)\bcatch\s+you\s+later\b",
+    r"(?i)\bpeace\s+out\b",
+    r"(?i)\btake\s+care\b",
+
+    # --- Sponsorship / affiliate / support ---
+    r"(?i)\bthis\s+video\s+is\s+sponsored\s+by\b",
+    r"(?i)\b(?:sponsor(?:ed)?|partner(?:ed)?)\s+(?:with|by)\b",
+    r"(?i)\buse\s+code\s+[A-Z0-9]{3,}\b",
+    r"(?i)\baffiliate\s+links?\b",
+    r"(?i)\b(?:support|supporting)\s+(?:the\s+)?channel\b",
+    r"(?i)\b(?:join|check\s+out)\s+my\s+patreon\b",
+    r"(?i)\bpatreon\.com\b",
+    r"(?i)\bko-?fi\.com\b",
+    r"(?i)\bbuy\s+me\s+a\s+coffee\b",
+    r"(?i)\bmy\s+merch\b",
+    r"(?i)\bmerch(?:andise)?\s+link\b",
+
+    # --- Social follows ---
+    r"(?i)\bfollow\s+me\s+on\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\b",
+    r"(?i)\b(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\.com\/\w+",
+    r"(?i)\bmy\s+(?:instagram|tiktok|twitter|x|twitch|facebook|threads)\s+is\b",
+
+    # --- Community / membership ---
+    r"(?i)\bjoin\s+(?:my|our)\s+discord\b",
+    r"(?i)\bdiscord\.gg\/?[A-Za-z0-9]+",
+    r"(?i)\bjoin\s+(?:the\s+)?channel\s+as\s+a\s+member\b",
+    r"(?i)\bbecome\s+a\s+member\b",
+
+    # --- Giveaways / goals / algorithm meta ---
+    r"(?i)\bgiveaway\b",
+    r"(?i)\blike\s+goal\b",
+    r"(?i)\blet'?s\s+get\s+to\s+\d+\s+likes\b",
+    r"(?i)\bhelps?\s+(?:with\s+)?the\s+algorithm\b",
+
+    # --- Captions/credits (existing) ---
+    r"(?i)\bsubtitles?\s+by\b",
+    r"(?i)\bcaptions?\s+by\b",
+    r"(?i)\bsubtitled\s+by\b",
+    r"(?i)\bclosed\s+captions?\s+by\b",
+    r"(?i)\bamara\.org\b",
+    r"(?i)\btranscription\s+by\b",
+
+    r"""(?ix)
+    ^ \s*
+    (?:                             # NUM
+        \d+ | [０-９]+ |
+        zero|oh|one|two|three|four|five|six|seven|eight|nine|
+        ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|
+        seventeen|eighteen|nineteen|
+        twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|
+        hundred|thousand|million|billion|
+        一|二|三|四|五|六|七|八|九|十|百|千|万|億|兆|〇|零|ゼロ|
+        いち|に|さん|よん|し|ご|ろく|なな|しち|はち|きゅう|く|じゅう|れい
+    )
+    (?:
+        (?:\s+|[,，、・/\\\-–—:;~〜～]|\b(?:and|to)\b|から|まで)+
+        (?:\d+|[０-９]+|
+        zero|oh|one|two|three|four|five|six|seven|eight|nine|
+        ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|
+        seventeen|eighteen|nineteen|
+        twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|
+        hundred|thousand|million|billion|
+        一|二|三|四|五|六|七|八|九|十|百|千|万|億|兆|〇|零|ゼロ|
+        いち|に|さん|よん|し|ご|ろく|なな|しち|はち|きゅう|く|じゅう|れい)
+    ){2,}
+    \s* [.!?！？…]* \s* $
+    """,
+
+
+    # --- Japanese equivalents (高頻出の定型) ---
+    r"チャンネル登録",
+    r"(?:高評価|いいね)[をを]?(?:お願いします|して[ねください!！]?)",
+    r"(?:通知|ベル)(?:を)?オン",
+    r"(?:ベル)?マーク(?:を)?(?:押して|タップして)",
+    r"(?:共有|シェア)して",
+    r"コメント(?:して|欄|ください|で教えて)",
+    r"(?:リンク|URL).*(?:概要欄|説明欄|プロフ|コメント)",
+    r"(?:概要欄|説明欄)を?見て",
+    r"(?:ご視聴|見てくれて)ありがとう(?:ございました)?",
+    r"また(?:次回|お会いしましょう|見てね)",
+    r"本日は(?:ここまで|以上)です",
+    r"(?:提供|スポンサー|PR|広告)",
+    r"(?:メンバーシップ|メンバー登録)",
+    r"(?:フォローして|SNS.*フォロー)",
+    r"(?:Discord|ディスコード).*(?:参加|入って)",
 ]
 
+_CTA_REGEXES = [re.compile(p) for p in _CTA_PATTERNS]
+
 def is_cta_like(text: str) -> bool:
-    if not text or len(text.strip()) < 2:
-        return False
-    for pat in _CTA_PATTERNS:
-        if re.search(pat, text):
-            return True
-    return False
+    if not text or len(text.strip()) < 2: return False
+    return any(rx.search(text) for rx in _CTA_REGEXES)
+
 
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
@@ -118,21 +232,7 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
 11) Drop standalone low-content interjections (“uh/erm”); keep one token max if needed (e.g., 「えっと」).
 12) Consistency — keep proper-noun spellings consistent across the session.
 13) Redundancy — if fully covered in <recent_target> with no new detail, output nothing.
-14) If this segment matches <hallucination_detection>, output nothing (empty string). Do not translate or insert markers.
 </priorities>
-
-<en_to_ja_specifics>
-- Omit subjects when natural; avoid inventing gender.
-- Map hedges/modality proportionally (“maybe/kinda/sort of” → 「たぶん／やや／少し」; “I think” → 「と思います／と思う」).
-- Requests/imperatives: preserve mood precisely.
-  * “Please/Could you …?” → 「…してください／…してもらえますか」 (minimal matching politeness)
-  * Bare imperative (“Do it.”) → imperative/plain; no softening.
-- Keep fragments if source is fragmentary; use 「…」/「—」 sparingly to reflect real hesitation/cut-offs.
-- Break long English chains into short, natural JP clauses without adding content.
-- Use standard JP technical terms; avoid awkward calques; keep terminology consistent.
-- Punctuation: prefer （、。）; keep ASCII for code/URLs/paths/CLI/units.
-- Counters: choose neutral counters only if unavoidable; otherwise rephrase to avoid guessing.
-</en_to_ja_specifics>
 
 <style_targets>
 - 明確・簡潔。
@@ -147,14 +247,6 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
 <recent_target>
 {recent_target_str}
 </recent_target>
-
-<hallucination_detection>
-- Exact-phrase repetition: if an identical clause/sentence appears ≥1 times in this segment, keep one instance; if the segment is mostly repetition (e.g., ≥70% tokens from repeating n-grams), output nothing.
-- Boilerplate loops: greetings/closings or templates repeated ≥1 times (e.g., “I hope you are doing well.” / “I hope you enjoy this video.”) → output nothing.
-- Counting-only runs: sequences like “one, two, three, …” without meaningful surrounding content → output nothing.
-- Low-content interjections: standalone “uh/um/erm” etc. → drop; keep ≤1 token only if hesitation matters.
-- Full redundancy with <recent_target> (no new info) → output nothing.
-</hallucination_detection>
 
 <examples_positive>
 <input>Please double-check the numbers.</input>
@@ -250,13 +342,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     result = model.transcribe(
                         wav.name,
                         fp16=True,
-                        temperature=0.0,
+                        temperature=(0.0, 0.2, 0.4),
                         beam_size=6,
                         condition_on_previous_text=False,
                         hallucination_silence_threshold=0.20,
                         no_speech_threshold=0.85,
                         language="en" if source_lang == "English" else "ja",
-                        compression_ratio_threshold=1.5,
+                        compression_ratio_threshold=2.4,
                         logprob_threshold=-0.6,
                         task=whisper_task,
                     )
