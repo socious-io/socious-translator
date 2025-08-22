@@ -147,49 +147,7 @@ _CTA_PATTERNS = [
     r"(?i)\bamara\.org\b",
     r"(?i)\btranscription\s+by\b",
 
-    r"""(?ix)
-    ^ \s*
-    (?:                             # NUM
-        \d+ | [０-９]+ |
-        zero|oh|one|two|three|four|five|six|seven|eight|nine|
-        ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|
-        seventeen|eighteen|nineteen|
-        twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|
-        hundred|thousand|million|billion|
-        一|二|三|四|五|六|七|八|九|十|百|千|万|億|兆|〇|零|ゼロ|
-        いち|に|さん|よん|し|ご|ろく|なな|しち|はち|きゅう|く|じゅう|れい
-    )
-    (?:
-        (?:\s+|[,，、・/\\\-–—:;~〜～]|\b(?:and|to)\b|から|まで)+
-        (?:\d+|[０-９]+|
-        zero|oh|one|two|three|four|five|six|seven|eight|nine|
-        ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|
-        seventeen|eighteen|nineteen|
-        twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|
-        hundred|thousand|million|billion|
-        一|二|三|四|五|六|七|八|九|十|百|千|万|億|兆|〇|零|ゼロ|
-        いち|に|さん|よん|し|ご|ろく|なな|しち|はち|きゅう|く|じゅう|れい)
-    ){2,}
-    \s* [.!?！？…]* \s* $
-    """,
-
-
-    # --- Japanese equivalents (高頻出の定型) ---
-    r"チャンネル登録",
-    r"(?:高評価|いいね)[をを]?(?:お願いします|して[ねください!！]?)",
-    r"(?:通知|ベル)(?:を)?オン",
-    r"(?:ベル)?マーク(?:を)?(?:押して|タップして)",
-    r"(?:共有|シェア)して",
-    r"コメント(?:して|欄|ください|で教えて)",
-    r"(?:リンク|URL).*(?:概要欄|説明欄|プロフ|コメント)",
-    r"(?:概要欄|説明欄)を?見て",
-    r"(?:ご視聴|見てくれて)ありがとう(?:ございました)?",
-    r"また(?:次回|お会いしましょう|見てね)",
-    r"本日は(?:ここまで|以上)です",
-    r"(?:提供|スポンサー|PR|広告)",
-    r"(?:メンバーシップ|メンバー登録)",
-    r"(?:フォローして|SNS.*フォロー)",
-    r"(?:Discord|ディスコード).*(?:参加|入って)",
+ 
 ]
 
 _CTA_REGEXES = [re.compile(p) for p in _CTA_PATTERNS]
@@ -348,8 +306,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         hallucination_silence_threshold=0.30,
                         no_speech_threshold=0.6,
                         language="en" if source_lang == "English" else "ja",
-                        compression_ratio_threshold=1.8,
-                        logprob_threshold=-0.4,
+                        compression_ratio_threshold=1.7,
+                        logprob_threshold=-0.3,
                         task=whisper_task,
                     )
 
