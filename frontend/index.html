@@ -51,7 +51,6 @@
 
     let ctx, node, stream, ws, timer;
     const MAX_CHARS = 400;
-
     const wsUrl = () => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws";
 
     const setButtons = (running) => {
@@ -63,10 +62,7 @@
       stopBtn.classList.toggle("cursor-not-allowed", !running);
     };
     const setStatus = (t) => statusEl.textContent = t || "";
-    const setActive = (t) => {
-      if (active.textContent !== t) active.textContent = t;
-      active.classList.toggle("caret", !!t);
-    };
+    const setActive = (t) => { if (active.textContent !== t) active.textContent = t; active.classList.toggle("caret", !!t); };
     const clearActive = () => setActive("");
 
     function trimToMax() {
@@ -107,7 +103,7 @@
       try {
         setStatus("Requesting mic…");
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
         });
 
         ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
@@ -116,16 +112,17 @@
         const source = ctx.createMediaStreamSource(stream);
         node = new AudioWorkletNode(ctx, "pcm-capture", {
           processorOptions: { downsampleTo: 16000, frameMs: 20 },
+          numberOfInputs: 1,
           numberOfOutputs: 1,
           outputChannelCount: [1]
         });
 
-        // keep the worklet in the graph so process() keeps firing
+        // Must be connected AND produce output; the worklet writes silence each render quantum.
         source.connect(node);
-        node.connect(ctx.destination);           // <- simplest, outputs silence anyway
+        node.connect(ctx.destination);
 
-        // make sure the context is actually running
         if (ctx.state === "suspended") await ctx.resume();
+        ctx.onstatechange = () => console.log("AudioContext state:", ctx.state);
 
         ws = new WebSocket(wsUrl());
         ws.binaryType = "arraybuffer";
@@ -133,23 +130,19 @@
           ws.send(JSON.stringify({ direction: directionSelect.value }));
           setButtons(true);
           setStatus("Streaming…");
-          timer = setInterval(() => {
-            if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" }));
-          }, 15000);
+          timer = setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 15000);
         };
         ws.onmessage = (e)=>handleMessage(e.data);
         ws.onclose   = ()=>{ setStatus("Disconnected"); setButtons(false); clearActive(); };
         ws.onerror   = (e)=>{ console.error(e); setStatus("WebSocket error"); };
 
-        // small counter so you can see frames flowing in DevTools
         let posted = 0, lastLog = performance.now();
         node.port.onmessage = (e) => {
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data); // ArrayBuffer (Int16 PCM)
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
           posted++;
           const now = performance.now();
           if (now - lastLog > 1000) { console.log(`worklet → WS frames: ${posted}/s`); posted = 0; lastLog = now; }
         };
-
         node.onprocessorerror = (e) => console.error("AudioWorklet error:", e);
       } catch (err) {
         console.error(err);
