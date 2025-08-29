@@ -119,11 +119,10 @@
           numberOfOutputs: 1,
           outputChannelCount: [1]
         });
-        source.connect(node);
 
-        // keep the worklet pulled by the audio engine (silent path to speakers)
-        const devnull = new GainNode(ctx, { gain: 0 });
-        node.connect(devnull).connect(ctx.destination);
+        // keep the worklet in the graph so process() keeps firing
+        source.connect(node);
+        node.connect(ctx.destination);           // <- simplest, outputs silence anyway
 
         // make sure the context is actually running
         if (ctx.state === "suspended") await ctx.resume();
@@ -142,9 +141,16 @@
         ws.onclose   = ()=>{ setStatus("Disconnected"); setButtons(false); clearActive(); };
         ws.onerror   = (e)=>{ console.error(e); setStatus("WebSocket error"); };
 
+        // small counter so you can see frames flowing in DevTools
+        let posted = 0, lastLog = performance.now();
         node.port.onmessage = (e) => {
           if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data); // ArrayBuffer (Int16 PCM)
+          posted++;
+          const now = performance.now();
+          if (now - lastLog > 1000) { console.log(`worklet → WS frames: ${posted}/s`); posted = 0; lastLog = now; }
         };
+
+        node.onprocessorerror = (e) => console.error("AudioWorklet error:", e);
       } catch (err) {
         console.error(err);
         setStatus(err?.message || "Mic error");
