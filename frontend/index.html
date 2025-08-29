@@ -19,7 +19,7 @@
     <div class="w-full flex flex-col lg:flex-row lg:items-end lg:justify-center lg:gap-6 space-y-4 lg:space-y-0">
       <div class="flex flex-col w-full lg:w-auto items-center">
         <label for="direction" class="text-base font-medium mb-1">Translation Direction</label>
-        <select id="direction" class="w-full lg:w-64 bg-[#2A2A2E] text-white border border-gray-700 rounded px-4 py-2 focus:outline-none text-center">
+        <select id="direction" class="w-full lg:w-64 bg-[#2A2A2E] text-white border border-gray-700 rounded px-4 py-2 text-center">
           <option value="en-ja">English → Japanese</option>
           <option value="ja-en">Japanese → English</option>
         </select>
@@ -49,13 +49,12 @@
     const active    = document.getElementById("active");
     const statusEl  = document.getElementById("status");
 
-    let ctx, node, stream, ws, timer;
+    let ws, stream, recorder, pingTimer;
     const MAX_CHARS = 400;
-    const wsUrl = () => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws";
 
+    const wsUrl = () => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws";
     const setButtons = (running) => {
-      startBtn.disabled = running;
-      stopBtn.disabled  = !running;
+      startBtn.disabled = running; stopBtn.disabled = !running;
       startBtn.classList.toggle("opacity-50", running);
       startBtn.classList.toggle("cursor-not-allowed", running);
       stopBtn.classList.toggle("opacity-50", !running);
@@ -66,9 +65,7 @@
     const clearActive = () => setActive("");
 
     function trimToMax() {
-      while (committed.innerText.length > MAX_CHARS && committed.firstElementChild) {
-        committed.removeChild(committed.firstElementChild);
-      }
+      while (committed.innerText.length > MAX_CHARS && committed.firstElementChild) committed.removeChild(committed.firstElementChild);
     }
     function commit(text, id=null) {
       const span = document.createElement("span");
@@ -77,9 +74,8 @@
       span.textContent = (text || "").trim();
       committed.appendChild(span);
       trimToMax();
-      window.requestAnimationFrame(() => { window.scrollTo({ top: document.body.scrollHeight }); });
+      requestAnimationFrame(() => { window.scrollTo({ top: document.body.scrollHeight }); });
     }
-
     function handleMessage(data) {
       if (typeof data !== "string") return;
       try {
@@ -103,47 +99,38 @@
       try {
         setStatus("Requesting mic…");
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
         });
 
-        ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-        await ctx.audioWorklet.addModule("/static/pcm-capture.worklet.js");
-
-        const source = ctx.createMediaStreamSource(stream);
-        node = new AudioWorkletNode(ctx, "pcm-capture", {
-          processorOptions: { downsampleTo: 16000, frameMs: 20 },
-          numberOfInputs: 1,
-          numberOfOutputs: 1,
-          outputChannelCount: [1]
-        });
-
-        // Must be connected AND produce output; the worklet writes silence each render quantum.
-        source.connect(node);
-        node.connect(ctx.destination);
-
-        if (ctx.state === "suspended") await ctx.resume();
-        ctx.onstatechange = () => console.log("AudioContext state:", ctx.state);
+        // Pick MIME BEFORE opening WS so we can tell the server the right demux format
+        const candidates = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/webm"];
+        let mime = "";
+        for (const t of candidates) if (MediaRecorder.isTypeSupported(t)) { mime = t; break; }
+        if (!mime) throw new Error("No supported MediaRecorder mime type (WebM/Opus).");
+        const format = mime.includes("ogg") ? "ogg" : "webm";
 
         ws = new WebSocket(wsUrl());
         ws.binaryType = "arraybuffer";
         ws.onopen = () => {
-          ws.send(JSON.stringify({ direction: directionSelect.value }));
+          // first message tells direction + container format
+          ws.send(JSON.stringify({ direction: directionSelect.value, format }));
           setButtons(true);
           setStatus("Streaming…");
-          timer = setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 15000);
+          pingTimer = setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 15000);
+
+          // start recorder AFTER the server is ready
+          recorder = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 128000 });
+          recorder.ondataavailable = async (e) => {
+            if (e.data && e.data.size > 0 && ws?.readyState === 1) {
+              const buf = await e.data.arrayBuffer();
+              ws.send(buf);
+            }
+          };
+          recorder.start(200); // ~200 ms chunks
         };
         ws.onmessage = (e)=>handleMessage(e.data);
         ws.onclose   = ()=>{ setStatus("Disconnected"); setButtons(false); clearActive(); };
         ws.onerror   = (e)=>{ console.error(e); setStatus("WebSocket error"); };
-
-        let posted = 0, lastLog = performance.now();
-        node.port.onmessage = (e) => {
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
-          posted++;
-          const now = performance.now();
-          if (now - lastLog > 1000) { console.log(`worklet → WS frames: ${posted}/s`); posted = 0; lastLog = now; }
-        };
-        node.onprocessorerror = (e) => console.error("AudioWorklet error:", e);
       } catch (err) {
         console.error(err);
         setStatus(err?.message || "Mic error");
@@ -152,13 +139,13 @@
     }
 
     function stopRecording() {
-      try { clearInterval(timer); } catch {}
-      try { node && (node.port.onmessage = null); } catch {}
+      try { clearInterval(pingTimer); } catch {}
+      try { recorder && recorder.state !== "inactive" && recorder.stop(); } catch {}
       try { stream?.getTracks().forEach(t=>t.stop()); } catch {}
-      try { ctx && ctx.close(); } catch {}
-      try { ws && ws.readyState === WebSocket.OPEN && ws.close(); } catch {}
+      try { ws && ws.readyState === 1 && ws.close(); } catch {}
       setButtons(false);
       clearActive();
+      setStatus("");
     }
 
     startBtn.onclick = startRecording;

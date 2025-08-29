@@ -1,8 +1,5 @@
 # main.py
-# MediaRecorder → WebSocket (WebM/Opus) → ffmpeg (long-lived) → PCM16 ring
-# Whisper large-v3 settings, your filters, and your translation prompt are unchanged.
-
-import os, json, re, uuid, time, contextlib, asyncio, subprocess, signal
+import os, json, re, uuid, time, contextlib, asyncio, subprocess, signal, sys
 import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
@@ -15,7 +12,6 @@ import torch
 import openai
 import uvicorn
 
-# ---------- setup ----------
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 client = openai.AsyncOpenAI(api_key=api_key)
@@ -30,7 +26,7 @@ app.add_middleware(
 async def serve_index():
     return FileResponse(os.path.join("frontend", "index.html"))
 
-# pre-warm tiny wav so first transcribe isn't hitchy
+# warm tiny wav (avoids first-call hitch)
 try:
     subprocess.run(
         ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-ar", "16000", "-ac", "1", "-y", "/tmp/warm.wav"],
@@ -39,7 +35,7 @@ try:
 except:
     pass
 
-# load Whisper once (large-v3)
+# Whisper
 torch.set_num_threads(1)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 model = whisper.load_model("large-v3", device=DEVICE)
@@ -48,32 +44,9 @@ try:
 except:
     pass
 
-# ---------- tiny live context ----------
-recent_src_segments: list[str] = []
-recent_targets: list[str] = []
-MAX_SRC_CTX = 2
-MAX_RECENT = 10
-
-# ---------- filters (unchanged) ----------
-THANKS_RE = re.compile(
-    r"""
-    ^\s*
-    (?:
-        (?:thank\s*(?:you|u)|thanks|thanx|thx|tks|ty|tysm|tyvm|
-         many\s*thanks|much\s*thanks|much\s*appreciated|appreciate\s*it|
-         cheers|ta|nice\s*one)
-        (?:\s*(?:so\s*much|very\s*much|a\s*lot|
-            everyone|everybody|all|y['’]?all|guys|folks|team))?
-        |you
-    )
-    \s*[!.…😊🙏💖✨👏👍]*\s*$
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-def is_interjection_thanks(text: str) -> bool:
-    if not text:
-        return False
-    return bool(THANKS_RE.match(text.strip()))
+# ---- your filters ----
+THANKS_RE = re.compile(r"""^\s*(?:(?:thank\s*(?:you|u)|thanks|thanx|thx|tks|ty|tysm|tyvm|many\s*thanks|much\s*thanks|much\s*appreciated|appreciate\s*it|cheers|ta|nice\s*one)(?:\s*(?:so\s*much|very\s*much|a\s*lot|everyone|everybody|all|y['’]?all|guys|folks|team))?|you)\s*[!.…😊🙏💖✨👏👍]*\s*$""", re.I)
+def is_interjection_thanks(t:str)->bool: return bool(t and THANKS_RE.match(t.strip()))
 
 _CTA_PATTERNS = [
     r"(?i)^\s*(?:hey|hi|hello|what'?s\s*up|yo|good\s+(?:morning|afternoon|evening))\s+(?:guys|everyone|everybody|folks|y['’]?all|friends)\b",
@@ -139,18 +112,19 @@ _CTA_PATTERNS = [
     r"(?i)\btranscription\s+by\b",
 ]
 _CTA_REGEXES = [re.compile(p) for p in _CTA_PATTERNS]
-def is_cta_like(text: str) -> bool:
-    if not text or len(text.strip()) < 2: return False
-    return any(rx.search(text) for rx in _CTA_REGEXES)
+def is_cta_like(t:str)->bool:
+    return bool(t and len(t.strip())>=2 and any(rx.search(t) for rx in _CTA_REGEXES))
 
-# ---------- translation prompt ----------
+recent_src_segments: list[str] = []
+recent_targets: list[str] = []
+MAX_SRC_CTX = 2
+MAX_RECENT = 10
+
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
     recent_target_str = "\n".join(recent_targets[-MAX_RECENT:])
-
     system = "Translate live ASR segments into natural, idiomatic target-language captions. Return ONLY the translation text."
-    user = f"""
-You are translating a single ASR segment from English → Japanese.
+    user = f"""You are translating a single ASR segment from English → Japanese.
 
 <goal>
 Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preserve original word strength, tone, and register. Use context only to resolve ambiguous pronouns or cut-offs.
@@ -221,16 +195,12 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
 <input>
 {text}
 </input>
-
 """.strip()
 
     try:
         resp = await client.chat.completions.create(
             model="gpt-5",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
             reasoning_effort="minimal",
             max_completion_tokens=128
         )
@@ -239,34 +209,50 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
         print("Translation error:", e)
         return ""
 
-# ---------- ffmpeg helper ----------
-def start_ffmpeg_to_pcm16():
-    # stdin: WebM/Ogg with Opus; stdout: raw s16le @16kHz mono
-    return subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-i", "pipe:0",
-         "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE
-    )
+# ---- ffmpeg helper (now takes input format, adds streaming flags, logs stderr) ----
+def start_ffmpeg_to_pcm16(fmt: str | None):
+    # fmt is "webm" or "ogg" (from client). Hint ffmpeg so it demuxes correctly.
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-fflags", "+genpts+nobuffer",
+        "-flags", "+low_delay",
+        "-use_wallclock_as_timestamps", "1",
+    ]
+    if fmt == "webm":
+        cmd += ["-f", "webm", "-i", "pipe:0"]
+    elif fmt == "ogg":
+        cmd += ["-f", "ogg", "-i", "pipe:0"]
+    else:
+        cmd += ["-i", "pipe:0"]
+    cmd += [
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "pipe:1",
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
 
 SAMPLE_RATE = 16000
-FRAME_BYTES = 320 * 2               # 20ms @16k mono, int16 → 640 bytes
+FRAME_BYTES = 320 * 2   # 20ms @16k mono → 640 bytes
 TICK_MS    = 200
 WIN_MS     = 1000
 HANG_MS    = 300
 
-# ---------- websocket ----------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
 
-    # first text message has direction (and optionally format), ignore others
     try:
         cfg = json.loads(await websocket.receive_text())
     except Exception:
         cfg = {}
     direction = cfg.get("direction", "en-ja")
+    in_format = (cfg.get("format") or "").lower()  # "webm" | "ogg" | ""
 
     if direction == "en-ja":
         source_lang, target_lang = "English", "Japanese"
@@ -280,8 +266,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    # long-lived ffmpeg for this socket
-    proc = start_ffmpeg_to_pcm16()
+    proc = start_ffmpeg_to_pcm16(in_format if in_format in ("webm","ogg") else None)
     vad = webrtcvad.Vad(2)
 
     ring = bytearray()
@@ -292,11 +277,9 @@ async def websocket_endpoint(websocket: WebSocket):
     ring_max   = win_bytes * 3
     tail_bytes = FRAME_BYTES * 5
 
-    # --- pump PCM out of ffmpeg (stdout) ---
     async def pump_pcm():
         loop = asyncio.get_running_loop()
         while True:
-            # read ~100ms per chunk
             chunk = await loop.run_in_executor(None, proc.stdout.read, FRAME_BYTES * 5)
             if not chunk:
                 break
@@ -304,7 +287,17 @@ async def websocket_endpoint(websocket: WebSocket):
             if len(ring) > ring_max:
                 del ring[:len(ring) - ring_max]
 
-    # --- accept browser chunks into ffmpeg (stdin) ---
+    async def pump_stderr():
+        # surface demux/codec errors so you can see what's wrong if any
+        try:
+            while True:
+                line = await asyncio.get_running_loop().run_in_executor(None, proc.stderr.readline)
+                if not line:
+                    break
+                sys.stderr.write("[ffmpeg] " + line.decode(errors="ignore"))
+        except Exception:
+            pass
+
     async def recv_loop():
         while True:
             msg = await websocket.receive()
@@ -314,35 +307,25 @@ async def websocket_endpoint(websocket: WebSocket):
                     proc.stdin.flush()
                 except BrokenPipeError:
                     break
-            # ignore pings/text
+            # ignore pings / other texts
 
     reader_task = asyncio.create_task(pump_pcm())
+    err_task    = asyncio.create_task(pump_stderr())
     writer_task = asyncio.create_task(recv_loop())
-
-    # simple byte logger so you can see flow
-    last_bytes_log = 0
-    bytes_since_log = 0
 
     try:
         while True:
             await asyncio.sleep(TICK_MS / 1000.0)
 
-            # instrumentation
-            if len(ring) > bytes_since_log:
-                bytes_since_log = len(ring)
-            now = time.time()
-            if now - last_bytes_log >= 0.5:
-                print(f"Ring ms: ~{len(ring)/2/SAMPLE_RATE*1000:.0f}")
-                last_bytes_log = now
+            # debug ring depth
+            print(f"Ring ms: ~{len(ring)/2/SAMPLE_RATE*1000:.0f}")
 
             if len(ring) < win_bytes:
                 continue
 
-            # slice last 1s
-            window_mv = memoryview(ring)[-win_bytes:]
-            pcm = np.frombuffer(window_mv, dtype=np.int16).astype(np.float32) / 32768.0
+            window = memoryview(ring)[-win_bytes:]
+            pcm = np.frombuffer(window, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # run Whisper off the loop
             loop = asyncio.get_running_loop()
             def _run():
                 return model.transcribe(
@@ -366,12 +349,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(f"[UPDATE]{json.dumps({'id':'live','text': partial})}")
                 last_partial = partial
 
-            # quick VAD over ~100ms tail
-            tail_mv = memoryview(ring)[-tail_bytes:]
+            tail = memoryview(ring)[-tail_bytes:]
             speech = False
-            for i in range(0, len(tail_mv), FRAME_BYTES):
-                frame_mv = tail_mv[i:i+FRAME_BYTES]
-                if len(frame_mv) == FRAME_BYTES and vad.is_speech(frame_mv.tobytes(), SAMPLE_RATE):
+            for i in range(0, len(tail), FRAME_BYTES):
+                fmv = tail[i:i+FRAME_BYTES]
+                if len(fmv) == FRAME_BYTES and vad.is_speech(fmv.tobytes(), SAMPLE_RATE):
                     speech = True
                     break
 
@@ -404,7 +386,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await websocket.send_text(f"[DONE]{json.dumps({'id': seg_id, 'text': translated})}")
                         asyncio.create_task(_translate_and_send())
                     else:
-                        translated = src_text  # ja→en direct
+                        translated = src_text  # ja→en uses Whisper translate result
                         if translated and not is_interjection_thanks(translated) and not is_cta_like(translated):
                             print(f"Translation: {translated}")
                             recent_src_segments.append(src_text)
@@ -419,15 +401,13 @@ async def websocket_endpoint(websocket: WebSocket):
         print("WebSocket error:", e)
     finally:
         with contextlib.suppress(Exception):
-            writer_task.cancel()
-            reader_task.cancel()
+            writer_task.cancel(); reader_task.cancel(); err_task.cancel()
         with contextlib.suppress(Exception):
-            proc.stdin.close(); proc.stdout.close()
+            proc.stdin.close(); proc.stdout.close(); proc.stderr.close()
             proc.send_signal(signal.SIGTERM)
         with contextlib.suppress(Exception):
             await websocket.close()
         print("WebSocket closed")
 
-# ---------- dev entry ----------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
