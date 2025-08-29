@@ -1,10 +1,10 @@
 # main.py
-# - One ffmpeg process per socket (no temp files, no restarts)
-# - Keep a rolling PCM buffer and run Whisper on a 1s window every ~200ms
-# - When we hear a short pause, finalize and run your translation prompt
-# - All your filters + prompt stay the same
+# - Browser sends raw 16 kHz Int16 PCM frames over WS (no decoding needed here)
+# - Keep a rolling PCM buffer and run Whisper on a short window every tick
+# - Finalize on a brief pause and run your translation prompt
+# - Whisper settings + filters + prompt remain the same
 
-import os, json, re, uuid, time, contextlib, asyncio, subprocess, signal
+import os, json, re, uuid, time, contextlib, asyncio, subprocess
 from collections import deque
 
 import numpy as np
@@ -35,7 +35,7 @@ app.add_middleware(
 async def serve_index():
     return FileResponse(os.path.join("frontend", "index.html"))
 
-# Pre-warm ffmpeg so the first decode doesn't hitch
+# Pre-warm ffmpeg only to generate a tiny wav for Whisper warmup 
 try:
     subprocess.run(
         ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-ar", "16000", "-ac", "1", "-y", "/tmp/warm.wav"],
@@ -44,7 +44,7 @@ try:
 except:
     pass
 
-# Load Whisper once (large-v3), do a tiny warmup
+# Load Whisper once (large-v3), do a tiny warmup 
 torch.set_num_threads(1)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 model = whisper.load_model("large-v3", device=DEVICE)
@@ -156,7 +156,7 @@ _CTA_PATTERNS = [
     r"(?i)\blet'?s\s+get\s+to\s+\d+\s+likes\b",
     r"(?i)\bhelps?\s+(?:with\s+)?the\s+algorithm\b",
 
-    # --- Captions/credits (existing) ---
+    # --- Captions/credits  ---
     r"(?i)\bsubtitles?\s+by\b",
     r"(?i)\bcaptions?\s+by\b",
     r"(?i)\bsubtitled\s+by\b",
@@ -169,7 +169,7 @@ def is_cta_like(text: str) -> bool:
     if not text or len(text.strip()) < 2: return False
     return any(rx.search(text) for rx in _CTA_REGEXES)
 
-# ---------- translation prompt (yours, verbatim) ----------
+# ---------- translation prompt  ----------
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
     recent_target_str = "\n".join(recent_targets[-MAX_RECENT:])
@@ -265,21 +265,12 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
         print("Translation error:", e)
         return ""
 
-# ---------- streaming utils ----------
-def start_ffmpeg_to_pcm16():
-    # stdin: WebM/Ogg w/ Opus, stdout: raw s16le @16kHz mono
-    return subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-i", "pipe:0",
-         "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE
-    )
-
+# ---------- streaming constants  ----------
 SAMPLE_RATE = 16000
 FRAME_BYTES = 320 * 2              # 20ms @16k mono, int16 → 640 bytes
-TICK_MS = 200                       # decode cadence
-WIN_MS  = 1000                      # rolling window size
-HANG_MS = 300                       # silence before we finalize
+TICK_MS = 150                       # decode cadence (snappier)
+WIN_MS  = 800                       # rolling window size
+HANG_MS = 250                       # silence before we finalize
 
 # ---------- websocket ----------
 @app.websocket("/ws")
@@ -287,7 +278,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
 
-    # first message is the direction
+    # first message is the direction (kept as-is)
     cfg = json.loads(await websocket.receive_text())
     direction = cfg.get("direction")
 
@@ -303,77 +294,69 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    # keep one ffmpeg alive for this socket
-    proc = start_ffmpeg_to_pcm16()
     vad = webrtcvad.Vad(2)
 
     ring = bytearray()
     last_partial = ""
     hang_ms = 0
 
-    async def pump_pcm():
-        # read raw PCM from ffmpeg stdout in ~100ms bites
-        loop = asyncio.get_running_loop()
-        while True:
-            chunk = await loop.run_in_executor(None, proc.stdout.read, FRAME_BYTES * 5)
-            if not chunk:
-                break
-            ring.extend(chunk)
+    win_bytes  = int(WIN_MS / 1000.0 * SAMPLE_RATE) * 2
+    ring_max   = win_bytes * 3              # cap buffer to ~3s so slices stay cheap
+    tail_bytes = FRAME_BYTES * 5            # 100ms for quick VAD
 
     async def recv_loop():
-        # shove incoming binary straight into ffmpeg's stdin
+        nonlocal ring
         while True:
             msg = await websocket.receive()
             if "bytes" in msg:
-                try:
-                    proc.stdin.write(msg["bytes"])
-                    proc.stdin.flush()
-                except BrokenPipeError:
-                    break
-            # ignore control pings
+                ring.extend(msg["bytes"])
+                # keep buffer bounded
+                if len(ring) > ring_max:
+                    del ring[:len(ring) - ring_max]
+            # ignore control pings etc.
 
-    reader_task = asyncio.create_task(pump_pcm())
-    writer_task = asyncio.create_task(recv_loop())
+    recv_task = asyncio.create_task(recv_loop())
 
     try:
         while True:
             await asyncio.sleep(TICK_MS / 1000.0)
 
-            # need at least 1s of audio for a decent hypothesis
-            win_bytes = int(WIN_MS / 1000.0 * SAMPLE_RATE) * 2
             if len(ring) < win_bytes:
                 continue
 
-            # take the latest 1s slice
-            window = ring[-win_bytes:]
-            pcm_i16 = np.frombuffer(window, dtype=np.int16).astype(np.float32) / 32768.0
+            # zero-copy slice of the last window
+            window_mv = memoryview(ring)[-win_bytes:]
+            pcm = np.frombuffer(window_mv, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # run Whisper 
-            result = model.transcribe(
-                pcm_i16,
-                fp16=True,
-                temperature=0.0,
-                beam_size=5,
-                condition_on_previous_text=False,
-                hallucination_silence_threshold=0.30,
-                no_speech_threshold=0.6,
-                language=lang_code,
-                compression_ratio_threshold=1.7,
-                logprob_threshold=-0.3,
-                task=whisper_task,
-            )
+            # run Whisper in a worker thread so the event loop stays responsive
+            loop = asyncio.get_running_loop()
+            def _run():
+                return model.transcribe(
+                    pcm,
+                    fp16=True,
+                    temperature=0.0,
+                    beam_size=5,
+                    condition_on_previous_text=False,
+                    hallucination_silence_threshold=0.30,
+                    no_speech_threshold=0.6,
+                    language=lang_code,
+                    compression_ratio_threshold=1.7,
+                    logprob_threshold=-0.3,
+                    task=whisper_task,
+                )
+            result = await loop.run_in_executor(None, _run)
             partial = (result.get("text") or "").strip()
 
             if partial and partial != last_partial:
                 await websocket.send_text(f"[UPDATE]{json.dumps({'id':'live','text': partial})}")
                 last_partial = partial
 
-            # quick VAD over the most recent 100ms
-            tail = ring[-FRAME_BYTES*5:]
+            # quick VAD over the most recent ~100ms (5x20ms)
+            tail_mv = memoryview(ring)[-tail_bytes:]
             speech = False
-            for i in range(0, len(tail), FRAME_BYTES):
-                frame = tail[i:i+FRAME_BYTES]
-                if len(frame) == FRAME_BYTES and vad.is_speech(frame, SAMPLE_RATE):
+            for i in range(0, len(tail_mv), FRAME_BYTES):
+                frame_mv = tail_mv[i:i+FRAME_BYTES]
+                if len(frame_mv) == FRAME_BYTES and vad.is_speech(frame_mv.tobytes(), SAMPLE_RATE):
                     speech = True
                     break
 
@@ -381,18 +364,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 hang_ms = 0
             else:
                 hang_ms += TICK_MS
-                # short pause → commit a final
                 if hang_ms >= HANG_MS and last_partial:
                     seg_id = str(uuid.uuid4())
                     src_text = last_partial.strip()
                     last_partial = ""
                     hang_ms = 0
 
-                    # toss low-value stuff early
+                    # toss low-value stuff early (kept as-is)
                     if is_interjection_thanks(src_text) or is_cta_like(src_text):
                         continue
 
-                    # pick translation path
                     if direction == "en-ja":
                         async def _translate_and_send():
                             translated = await translate_text(src_text, source_lang, target_lang)
@@ -420,13 +401,8 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print("WebSocket error:", e)
     finally:
-        # tear everything down without drama
         with contextlib.suppress(Exception):
-            writer_task.cancel()
-            reader_task.cancel()
-        with contextlib.suppress(Exception):
-            proc.stdin.close(); proc.stdout.close()
-            proc.send_signal(signal.SIGTERM)
+            recv_task.cancel()
         with contextlib.suppress(Exception):
             await websocket.close()
         print("WebSocket closed")
