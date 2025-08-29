@@ -1,17 +1,13 @@
 # main.py
-# - Browser sends raw 16 kHz Int16 PCM frames over WS
-# - Rolling window decode; finalize on brief pause
-# - Whisper settings + filters + prompt remain the same
+# MediaRecorder → WebSocket (WebM/Opus) → ffmpeg (long-lived) → PCM16 ring
+# Whisper large-v3 settings, your filters, and your translation prompt are unchanged.
 
-import os, json, re, uuid, time, contextlib, asyncio, subprocess
-from collections import deque
-
+import os, json, re, uuid, time, contextlib, asyncio, subprocess, signal
 import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles  # serve /static for the worklet
 
 import webrtcvad
 import whisper
@@ -30,15 +26,11 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# Serve the UI at /
 @app.get("/")
 async def serve_index():
     return FileResponse(os.path.join("frontend", "index.html"))
 
-# Serve the worklet at /static/pcm-capture.worklet.js
-app.mount("/static", StaticFiles(directory="frontend"), name="static")
-
-# Pre-warm ffmpeg only to generate a tiny wav for Whisper warmup 
+# pre-warm tiny wav so first transcribe isn't hitchy
 try:
     subprocess.run(
         ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-ar", "16000", "-ac", "1", "-y", "/tmp/warm.wav"],
@@ -47,7 +39,7 @@ try:
 except:
     pass
 
-# Load Whisper once (large-v3), tiny warmup 
+# load Whisper once (large-v3)
 torch.set_num_threads(1)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 model = whisper.load_model("large-v3", device=DEVICE)
@@ -56,13 +48,13 @@ try:
 except:
     pass
 
-# ---------- tiny live context  ----------
+# ---------- tiny live context ----------
 recent_src_segments: list[str] = []
 recent_targets: list[str] = []
 MAX_SRC_CTX = 2
 MAX_RECENT = 10
 
-# ---------- filters  ----------
+# ---------- filters (unchanged) ----------
 THANKS_RE = re.compile(
     r"""
     ^\s*
@@ -84,12 +76,10 @@ def is_interjection_thanks(text: str) -> bool:
     return bool(THANKS_RE.match(text.strip()))
 
 _CTA_PATTERNS = [
-    # --- Intros / greetings (channel meta) ---
     r"(?i)^\s*(?:hey|hi|hello|what'?s\s*up|yo|good\s+(?:morning|afternoon|evening))\s+(?:guys|everyone|everybody|folks|y['’]?all|friends)\b",
     r"(?i)\bwelcome\s+(?:back\s+)?to\s+my\s+channel\b",
     r"(?i)\bwelcome\s+(?:back\s+)?(?:everyone|guys|y['’]?all|friends)\b",
     r"(?i)\bthanks?\s+for\s+joining\s+(?:me|us)\b",
-    # --- Like / comment / subscribe combos ---
     r"(?i)\blike\s*(?:,?\s*comment\s*)?(?:,?\s*and\s*)?subscribe\b",
     r"(?i)\bsubscribe\s*(?:,?\s*and\s*)?(?:like|comment)\b",
     r"(?i)\b(?:like|comment|subscribe)\b(?:\s*[,&/]\s*\b(?:like|comment|subscribe)\b){1,2}",
@@ -99,23 +89,19 @@ _CTA_PATTERNS = [
     r"(?i)\bsubscribe\s+(?:for|to)\s+more\b",
     r"(?i)\bsubscribe\s+now\b",
     r"(?i)\bhelp\s+(?:the\s+)?channel\s+by\s+(?:liking|subscribing)\b",
-    # --- Notifications ---
     r"(?i)\b(?:ring|hit|tap|click)\s+(?:the\s+)?(?:notification\s+)?bell\b",
     r"(?i)\bturn\s+on\s+(?:the\s+)?notifications?\b",
     r"(?i)\benable\s+(?:post\s+)?notifications?\b",
     r"(?i)\bdon'?t\s+forget\s+(?:to\s+)?(?:like|comment|share|subscribe|turn\s+on\s+notifications?)\b",
-    # --- Share / links / description ---
     r"(?i)\bshare\s+(?:this|the)\s+(?:video|stream|clip|content|tutorial)\b",
     r"(?i)\bplease\s+share\b",
     r"(?i)\b(?:link|links?)\s+in\s+(?:the\s+)?(?:bio|description|comments?)\b",
     r"(?i)\bcheck\s+(?:the\s+)?link\s+(?:below|above)\b",
     r"(?i)\bmore\s+info\s+in\s+(?:the\s+)?description\b",
-    # --- Comment prompts ---
     r"(?i)\b(?:leave|drop|post)\s+(?:a|your)?\s*comment[s]?\b",
     r"(?i)\bcomment\s+(?:below|down\s+below)\b",
     r"(?i)\btell\s+me\s+in\s+the\s+comments?\b",
     r"(?i)\bwhat\s+do\s+you\s+think\s+in\s+the\s+comments?\b",
-    # --- Outros / closings ---
     r"(?i)\bthanks?\s+for\s+(?:watching|tuning\s+in|coming\s+by|listening)\b",
     r"(?i)\bthank\s+you\s+for\s+(?:watching|tuning\s+in|coming\s+by|listening)\b",
     r"(?i)\bsee\s+you\s+(?:next\s*time|tomorrow|soon|in\s+the\s+next(?:\s+one|video)?)\b",
@@ -123,7 +109,6 @@ _CTA_PATTERNS = [
     r"(?i)\bcatch\s+you\s+later\b",
     r"(?i)\bpeace\s+out\b",
     r"(?i)\btake\s+care\b",
-    # --- Sponsorship / affiliate / support ---
     r"(?i)\bthis\s+video\s+is\s+sponsored\s+by\b",
     r"(?i)\b(?:sponsor(?:ed)?|partner(?:ed)?)\s+(?:with|by)\b",
     r"(?i)\buse\s+code\s+[A-Z0-9]{3,}\b",
@@ -135,21 +120,17 @@ _CTA_PATTERNS = [
     r"(?i)\bbuy\s+me\s+a\s+coffee\b",
     r"(?i)\bmy\s+merch\b",
     r"(?i)\bmerch(?:andise)?\s+link\b",
-    # --- Social follows ---
     r"(?i)\bfollow\s+me\s+on\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\b",
     r"(?i)\b(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\.com\/\w+",
     r"(?i)\bmy\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\s+is\b",
-    # --- Community / membership ---
     r"(?i)\bjoin\s+(?:my|our)\s+discord\b",
     r"(?i)\bdiscord\.gg\/?[A-Za-z0-9]+",
     r"(?i)\bjoin\s+(?:the\s+)?channel\s+as\s+a\s+member\b",
     r"(?i)\bbecome\s+a\s+member\b",
-    # --- Giveaways / goals / algorithm meta ---
     r"(?i)\bgiveaway\b",
     r"(?i)\blike\s+goal\b",
     r"(?i)\blet'?s\s+get\s+to\s+\d+\s+likes\b",
     r"(?i)\bhelps?\s+(?:with\s+)?the\s+algorithm\b",
-    # --- Captions/credits  ---
     r"(?i)\bsubtitles?\s+by\b",
     r"(?i)\bcaptions?\s+by\b",
     r"(?i)\bsubtitled\s+by\b",
@@ -258,12 +239,21 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
         print("Translation error:", e)
         return ""
 
-# ---------- streaming constants ----------
+# ---------- ffmpeg helper ----------
+def start_ffmpeg_to_pcm16():
+    # stdin: WebM/Ogg with Opus; stdout: raw s16le @16kHz mono
+    return subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-i", "pipe:0",
+         "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    )
+
 SAMPLE_RATE = 16000
-FRAME_BYTES = 320 * 2              # 20ms @16k mono, int16 → 640 bytes
-TICK_MS = 200
-WIN_MS  = 1000
-HANG_MS = 300
+FRAME_BYTES = 320 * 2               # 20ms @16k mono, int16 → 640 bytes
+TICK_MS    = 200
+WIN_MS     = 1000
+HANG_MS    = 300
 
 # ---------- websocket ----------
 @app.websocket("/ws")
@@ -271,9 +261,12 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
 
-    # first message is the direction
-    cfg = json.loads(await websocket.receive_text())
-    direction = cfg.get("direction")
+    # first text message has direction (and optionally format), ignore others
+    try:
+        cfg = json.loads(await websocket.receive_text())
+    except Exception:
+        cfg = {}
+    direction = cfg.get("direction", "en-ja")
 
     if direction == "en-ja":
         source_lang, target_lang = "English", "Japanese"
@@ -287,6 +280,8 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
+    # long-lived ffmpeg for this socket
+    proc = start_ffmpeg_to_pcm16()
     vad = webrtcvad.Vad(2)
 
     ring = bytearray()
@@ -294,53 +289,60 @@ async def websocket_endpoint(websocket: WebSocket):
     hang_ms = 0
 
     win_bytes  = int(WIN_MS / 1000.0 * SAMPLE_RATE) * 2
-    ring_max   = win_bytes * 3              # cap buffer to ~3s so slices stay cheap
-    tail_bytes = FRAME_BYTES * 5            # 100ms for quick VAD
+    ring_max   = win_bytes * 3
+    tail_bytes = FRAME_BYTES * 5
 
-    # --- instrumentation ---
-    last_bytes_log = 0
-    bytes_since_log = 0
-    last_audio_ts = time.time()
+    # --- pump PCM out of ffmpeg (stdout) ---
+    async def pump_pcm():
+        loop = asyncio.get_running_loop()
+        while True:
+            # read ~100ms per chunk
+            chunk = await loop.run_in_executor(None, proc.stdout.read, FRAME_BYTES * 5)
+            if not chunk:
+                break
+            ring.extend(chunk)
+            if len(ring) > ring_max:
+                del ring[:len(ring) - ring_max]
 
+    # --- accept browser chunks into ffmpeg (stdin) ---
     async def recv_loop():
-        nonlocal ring, bytes_since_log, last_audio_ts
         while True:
             msg = await websocket.receive()
             if "bytes" in msg and msg["bytes"]:
-                b = msg["bytes"]
-                ring.extend(b)
-                bytes_since_log += len(b)
-                last_audio_ts = time.time()
-                # keep buffer bounded
-                if len(ring) > ring_max:
-                    del ring[:len(ring) - ring_max]
-            # ignore control pings etc.
+                try:
+                    proc.stdin.write(msg["bytes"])
+                    proc.stdin.flush()
+                except BrokenPipeError:
+                    break
+            # ignore pings/text
 
-    recv_task = asyncio.create_task(recv_loop())
+    reader_task = asyncio.create_task(pump_pcm())
+    writer_task = asyncio.create_task(recv_loop())
+
+    # simple byte logger so you can see flow
+    last_bytes_log = 0
+    bytes_since_log = 0
 
     try:
         while True:
             await asyncio.sleep(TICK_MS / 1000.0)
 
-            # periodic byte counter so you can see audio flow
+            # instrumentation
+            if len(ring) > bytes_since_log:
+                bytes_since_log = len(ring)
             now = time.time()
             if now - last_bytes_log >= 0.5:
-                if bytes_since_log:
-                    print(f"WS bytes: +{bytes_since_log} (ring={len(ring)} bytes, ~{len(ring)/2/SAMPLE_RATE*1000:.0f} ms)")
-                    bytes_since_log = 0
-                if now - last_audio_ts > 2.0:
-                    print("⚠️  No audio arriving for >2s (check mic/worklet/HTTPS).")
-                    last_audio_ts = now  # avoid spamming
+                print(f"Ring ms: ~{len(ring)/2/SAMPLE_RATE*1000:.0f}")
                 last_bytes_log = now
 
             if len(ring) < win_bytes:
                 continue
 
-            # zero-copy slice of the last window
+            # slice last 1s
             window_mv = memoryview(ring)[-win_bytes:]
             pcm = np.frombuffer(window_mv, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # run Whisper in a worker thread so the event loop stays responsive
+            # run Whisper off the loop
             loop = asyncio.get_running_loop()
             def _run():
                 return model.transcribe(
@@ -364,7 +366,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(f"[UPDATE]{json.dumps({'id':'live','text': partial})}")
                 last_partial = partial
 
-            # quick VAD over the most recent ~100ms (5x20ms)
+            # quick VAD over ~100ms tail
             tail_mv = memoryview(ring)[-tail_bytes:]
             speech = False
             for i in range(0, len(tail_mv), FRAME_BYTES):
@@ -383,7 +385,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     last_partial = ""
                     hang_ms = 0
 
-                    # toss low-value stuff early
                     if is_interjection_thanks(src_text) or is_cta_like(src_text):
                         continue
 
@@ -403,8 +404,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await websocket.send_text(f"[DONE]{json.dumps({'id': seg_id, 'text': translated})}")
                         asyncio.create_task(_translate_and_send())
                     else:
-                        # ja→en uses Whisper translate output as final
-                        translated = src_text
+                        translated = src_text  # ja→en direct
                         if translated and not is_interjection_thanks(translated) and not is_cta_like(translated):
                             print(f"Translation: {translated}")
                             recent_src_segments.append(src_text)
@@ -419,7 +419,11 @@ async def websocket_endpoint(websocket: WebSocket):
         print("WebSocket error:", e)
     finally:
         with contextlib.suppress(Exception):
-            recv_task.cancel()
+            writer_task.cancel()
+            reader_task.cancel()
+        with contextlib.suppress(Exception):
+            proc.stdin.close(); proc.stdout.close()
+            proc.send_signal(signal.SIGTERM)
         with contextlib.suppress(Exception):
             await websocket.close()
         print("WebSocket closed")
