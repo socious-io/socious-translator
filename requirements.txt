@@ -8,11 +8,7 @@ openai>=1.30
 # Whisper (OpenAI’s)
 openai-whisper>=20231117
 
-# VAD + array utils for the streaming loop
-numpy>=1.26
-webrtcvad>=2.0.10
-
-# misc
+# Utils
 python-dotenv>=1.0
-tqdm>=4.66
 
+tqdm>=4.66

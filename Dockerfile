@@ -1,49 +1,39 @@
-# CUDA runtime with cuDNN on Ubuntu 22.04
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    XDG_CACHE_HOME=/opt/cache \
-    TOKENIZERS_PARALLELISM=false
+    XDG_CACHE_HOME=/opt/cache
 
-# System deps:
-# - python3.11 + headers (webrtcvad builds)
-# - ffmpeg (if you use Opus->PCM path)
-# - build-essential (native wheels)
-# - curl (prefetch model)
+# OS deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3.11-dev python3-pip \
-    ffmpeg ca-certificates curl build-essential \
+    python3.11 python3.11-venv python3-pip ffmpeg ca-certificates curl \
  && ln -s /usr/bin/python3.11 /usr/local/bin/python \
- && python -m pip install --upgrade pip setuptools wheel \
+ && python -m pip install --upgrade pip \
  && mkdir -p ${XDG_CACHE_HOME} \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Torch (CUDA 12.1) first so layers cache well
+# --- Install torch (CUDA) & Python deps first (stable layers)
 RUN python -m pip install --no-cache-dir \
     torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Python deps
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-# Optional: prefetch Whisper large-v3 weights into the image
-# Toggle with: --build-arg PRELOAD_WHISPER=0
-ARG PRELOAD_WHISPER=1
-RUN if [ "$PRELOAD_WHISPER" = "1" ]; then \
-      mkdir -p "${XDG_CACHE_HOME}/whisper" && \
-      if [ ! -f "${XDG_CACHE_HOME}/whisper/large-v3.pt" ]; then \
-        echo "Prefetching Whisper large-v3 model..."; \
-        curl -L -o "${XDG_CACHE_HOME}/whisper/large-v3.pt" \
-          https://openaipublic.blob.core.windows.net/whisper/models/large-v3.pt; \
-      else \
-        echo "Whisper model already present."; \
-      fi; \
-    fi
+# --- Preload Whisper model into cache (persists in image)
+# This downloads model files into /opt/cache/whisper (because of XDG_CACHE_HOME)
+RUN python - <<'PY'
+import whisper, os
+print("Cache dir:", os.getenv("XDG_CACHE_HOME"))
+whisper.load_model("large-v3")
+print("Preloaded whisper model.")
+PY
 
-# App code last so code edits don’t bust cached heavy layers
+# Verify (optional)
+RUN ls -lh ${XDG_CACHE_HOME}/whisper || true
+
+# --- Copy app code last so edits don’t bust the cached model layer
 COPY . .
 
 EXPOSE 8000

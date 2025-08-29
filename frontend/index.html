@@ -1,25 +1,28 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
+  <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Socious Translator (Whisper large-v3)</title>
+  <title>Socious Translator</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    body { font-family: Inter, "Helvetica Neue", Arial, sans-serif; }
-    .caret::after { content: " ▌"; opacity: .6; }
-    #committed { display:block; white-space:normal; line-height:1.6; word-break:break-word; }
-    #committed .seg::after { content:" "; }
+    body { font-family: 'Inter', 'Helvetica Neue', sans-serif; }
+    .caret::after { content: ' ▌'; opacity: 0.6; }
+    /* Make the output look like one flowing paragraph */
+    #committed { display: block; white-space: normal; line-height: 1.6; word-break: break-word; }
+    #committed .seg::after { content: " "; } /* space between segments */
   </style>
 </head>
 <body class="bg-[#111112] text-white min-h-screen flex flex-col items-center justify-start p-6 space-y-10">
+
   <h1 class="text-3xl font-bold tracking-tight text-center">Socious Translator</h1>
 
+  <!-- Controls -->
   <div class="w-full max-w-3xl bg-[#1A1A1C] rounded-2xl p-6 shadow-lg flex flex-col items-center space-y-6">
     <div class="w-full flex flex-col lg:flex-row lg:items-end lg:justify-center lg:gap-6 space-y-4 lg:space-y-0">
       <div class="flex flex-col w-full lg:w-auto items-center">
         <label for="direction" class="text-base font-medium mb-1">Translation Direction</label>
-        <select id="direction" class="w-full lg:w-64 bg-[#2A2A2E] text-white border border-gray-700 rounded px-4 py-2 text-center">
+        <select id="direction" class="w-full lg:w-64 bg-[#2A2A2E] text-white border border-gray-700 rounded px-4 py-2 focus:outline-none text-center">
           <option value="en-ja">English → Japanese</option>
           <option value="ja-en">Japanese → English</option>
         </select>
@@ -32,6 +35,7 @@
     <div id="status" class="text-sm text-gray-400"></div>
   </div>
 
+  <!-- Output -->
   <div class="w-full max-w-4xl flex flex-col space-y-6 items-center">
     <div class="w-full">
       <div id="output" class="bg-[#1A1A1C] rounded-lg px-6 py-10 shadow-md text-2xl font-semibold leading-8 tracking-wide min-h-[160px] w-full">
@@ -41,115 +45,205 @@
     </div>
   </div>
 
-  <script type="module">
+  <script>
     const startBtn = document.getElementById("startBtn");
-    const stopBtn  = document.getElementById("stopBtn");
+    const stopBtn = document.getElementById("stopBtn");
     const directionSelect = document.getElementById("direction");
     const committed = document.getElementById("committed");
-    const active    = document.getElementById("active");
-    const statusEl  = document.getElementById("status");
+    const active = document.getElementById("active");
+    const statusEl = document.getElementById("status");
 
-    let ws, stream, recorder, pingTimer;
-    const MAX_CHARS = 400;
+    let mediaStream = null;
+    let socket = null;
+    let recording = false;
 
-    const wsUrl = () => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws";
-    const setButtons = (running) => {
-      startBtn.disabled = running; stopBtn.disabled = !running;
+    const MAX_CHARS = 400; // keep the live paragraph readable
+
+    function wsUrl() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      return `${proto}://${location.host}/ws`;
+    }
+
+    directionSelect.onchange = () => stopRecording();
+
+    function setButtons(running) {
+      startBtn.disabled = running;
+      stopBtn.disabled = !running;
       startBtn.classList.toggle("opacity-50", running);
       startBtn.classList.toggle("cursor-not-allowed", running);
       stopBtn.classList.toggle("opacity-50", !running);
       stopBtn.classList.toggle("cursor-not-allowed", !running);
-    };
-    const setStatus = (t) => statusEl.textContent = t || "";
-    const setActive = (t) => { if (active.textContent !== t) active.textContent = t; active.classList.toggle("caret", !!t); };
-    const clearActive = () => setActive("");
-
-    function trimToMax() {
-      while (committed.innerText.length > MAX_CHARS && committed.firstElementChild) committed.removeChild(committed.firstElementChild);
     }
-    function commit(text, id=null) {
+
+    function setStatus(text) {
+      statusEl.textContent = text || "";
+    }
+
+    function setActivePartial(text) {
+      active.textContent = text || "";
+      active.classList.toggle("caret", !!text);
+    }
+
+    function clearActivePartial() {
+      setActivePartial("");
+    }
+
+    function totalChars() {
+      return committed.innerText.length;
+    }
+
+    function trimToMaxChars() {
+      while (totalChars() > MAX_CHARS && committed.firstElementChild) {
+        committed.removeChild(committed.firstElementChild);
+      }
+    }
+
+    function commitFinal(text, id = null) {
       const span = document.createElement("span");
       span.className = "seg";
       if (id) span.dataset.id = id;
       span.textContent = (text || "").trim();
       committed.appendChild(span);
-      trimToMax();
-      requestAnimationFrame(() => { window.scrollTo({ top: document.body.scrollHeight }); });
-    }
-    function handleMessage(data) {
-      if (typeof data !== "string") return;
-      try {
-        if (data.startsWith("[UPDATE]")) {
-          const { id, text } = JSON.parse(data.slice(8));
-          if (id === "live") setActive(text || "");
-          return;
-        }
-        if (data.startsWith("[DONE]")) {
-          const { id, text } = JSON.parse(data.slice(6));
-          clearActive();
-          commit(text || "", id);
-          return;
-        }
-      } catch(e) { console.warn("parse error", e); }
+      trimToMaxChars();
+      window.requestAnimationFrame(() => {
+        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      });
     }
 
-    directionSelect.onchange = () => stopRecording();
+    // Server only sends [DONE] (finals) and [UPDATE] (optional edits to past ids)
+    function handleMessage(data) {
+      try {
+        if (typeof data !== "string") return;
+        if (data.startsWith("[DONE]")) {
+          const { id, text } = JSON.parse(data.replace("[DONE]", ""));
+          clearActivePartial();
+          commitFinal(text || "", id);
+          return;
+        }
+        if (data.startsWith("[UPDATE]")) {
+          const { id, text } = JSON.parse(data.replace("[UPDATE]", ""));
+          if (id) {
+            const target = committed.querySelector(`[data-id="${id}"]`);
+            if (target) {
+              target.textContent = (text || "").trim();
+              trimToMaxChars();
+            }
+          }
+          return;
+        }
+      } catch (e) {
+        console.warn("Message parse error:", e);
+      }
+    }
 
     async function startRecording() {
       try {
-        setStatus("Requesting mic…");
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-        });
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error("getUserMedia not available.");
+        if (!("MediaRecorder" in window)) throw new Error("MediaRecorder not supported.");
 
-        // Pick MIME BEFORE opening WS so we can tell the server the right demux format
-        const candidates = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/webm"];
-        let mime = "";
-        for (const t of candidates) if (MediaRecorder.isTypeSupported(t)) { mime = t; break; }
-        if (!mime) throw new Error("No supported MediaRecorder mime type (WebM/Opus).");
-        const format = mime.includes("ogg") ? "ogg" : "webm";
+        const preferred = [
+          "audio/ogg;codecs=opus",
+          "audio/webm;codecs=opus",
+          "audio/webm"
+        ];
+        let mimeType = "";
+        for (const t of preferred) {
+          try { if (MediaRecorder.isTypeSupported(t)) { mimeType = t; break; } } catch {}
+        }
+        if (!mimeType) throw new Error("No supported audio MIME type (WebM/Opus) found.");
 
-        ws = new WebSocket(wsUrl());
-        ws.binaryType = "arraybuffer";
-        ws.onopen = () => {
-          // first message tells direction + container format
-          ws.send(JSON.stringify({ direction: directionSelect.value, format }));
+        // permission hint where supported
+        if (navigator.permissions?.query) {
+          try {
+            const p = await navigator.permissions.query({ name: "microphone" });
+            setStatus(`Microphone permission: ${p.state}`);
+          } catch {}
+        }
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        setStatus("Connecting…");
+        socket = new WebSocket(wsUrl());
+
+        socket.onopen = () => {
+          try {
+            socket.send(JSON.stringify({ direction: directionSelect.value }));
+          } catch {}
+          recording = true;
           setButtons(true);
-          setStatus("Streaming…");
-          pingTimer = setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 15000);
-
-          // start recorder AFTER the server is ready
-          recorder = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 128000 });
-          recorder.ondataavailable = async (e) => {
-            if (e.data && e.data.size > 0 && ws?.readyState === 1) {
-              const buf = await e.data.arrayBuffer();
-              ws.send(buf);
-            }
-          };
-          recorder.start(200); // ~200 ms chunks
+          setStatus("Recording…");
+          recordLoop(mimeType);
         };
-        ws.onmessage = (e)=>handleMessage(e.data);
-        ws.onclose   = ()=>{ setStatus("Disconnected"); setButtons(false); clearActive(); };
-        ws.onerror   = (e)=>{ console.error(e); setStatus("WebSocket error"); };
+
+        socket.onmessage = (e) => handleMessage(e.data);
+
+        socket.onclose = () => {
+          setButtons(false);
+          setActivePartial("");
+          setStatus("Disconnected");
+          recording = false;
+        };
+
+        socket.onerror = (e) => {
+          console.error("WebSocket error:", e);
+          setStatus("WebSocket error");
+        };
+
       } catch (err) {
-        console.error(err);
-        setStatus(err?.message || "Mic error");
+        console.error("Error starting recording:", err);
+        setStatus(
+          (err && err.name) ? `Mic error: ${err.name}` :
+          (err && err.message) ? `Mic error: ${err.message}` :
+          "Mic error"
+        );
         stopRecording();
       }
     }
 
+    async function recordLoop(mimeType) {
+      while (recording) {
+        let recorder;
+        try {
+          recorder = new MediaRecorder(mediaStream, { mimeType });
+        } catch (e) {
+          console.error("Failed to create MediaRecorder:", e);
+          setStatus("Failed to create MediaRecorder");
+          stopRecording();
+          return;
+        }
+
+        recorder.ondataavailable = async (e) => {
+          if (e.data && e.data.size > 0 && socket?.readyState === WebSocket.OPEN) {
+            try {
+              const buf = await e.data.arrayBuffer();
+              socket.send(buf);
+            } catch (err) {
+              console.warn("send buffer error:", err);
+            }
+          }
+        };
+
+        recorder.start();
+        await new Promise((resolve) => {
+          setTimeout(() => {
+            try { recorder.stop(); } catch {}
+            resolve();
+          }, 2800); // ~2.8s chunks
+        });
+      }
+    }
+
     function stopRecording() {
-      try { clearInterval(pingTimer); } catch {}
-      try { recorder && recorder.state !== "inactive" && recorder.stop(); } catch {}
-      try { stream?.getTracks().forEach(t=>t.stop()); } catch {}
-      try { ws && ws.readyState === 1 && ws.close(); } catch {}
+      recording = false;
+      try { mediaStream?.getTracks().forEach(t => t.stop()); } catch {}
+      try { socket && socket.readyState === WebSocket.OPEN && socket.close(); } catch {}
+      setActivePartial("");
       setButtons(false);
-      clearActive();
-      setStatus("");
+      if (!statusEl.textContent) setStatus("");
     }
 
     startBtn.onclick = startRecording;
-    stopBtn.onclick  = stopRecording;
+    stopBtn.onclick = stopRecording;
 
     if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
       setStatus("Tip: Microphone requires HTTPS or localhost.");
