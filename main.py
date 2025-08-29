@@ -1,39 +1,15 @@
-# main.py
-# Back to the simple, chunky pipeline:
-# - Browser sends ~2.8s WebM/Opus blobs over WebSocket
-# - We write each blob to a temp .webm, convert to .wav with ffmpeg
-# - Run Whisper large-v3 on that wav with your exact settings
-# - Apply your CTA/thanks filters
-# - en→ja goes through your translation prompt; ja→en uses Whisper translate
-# - Emit [DONE]{id,text}; optional [UPDATE] messages are ignored by default
-
-import tempfile, subprocess, os, json, uuid, re
-from dotenv import load_dotenv
+import tempfile, subprocess, uvicorn, openai, whisper, os, json, uuid, re
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from dotenv import load_dotenv
 
-import whisper
-import torch
-import openai
-import uvicorn
-
-# ------- setup -------
+# basic setup and client
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 client = openai.AsyncOpenAI(api_key=api_key)
 
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
-)
-
-@app.get("/")
-async def serve_index():
-    return FileResponse(os.path.join("frontend", "index.html"))
-
-# pre-warm ffmpeg so the first request isn't hitchy
+# pre-warm ffmpeg so the first request isn't slow
 try:
     subprocess.run(
         ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-ar", "16000", "-ac", "1", "-y", "/tmp/warm.wav"],
@@ -43,22 +19,27 @@ try:
 except:
     pass
 
-# load Whisper once
-torch.set_num_threads(1)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-model = whisper.load_model("large-v3", device=DEVICE)
+# load whisper once
+model = whisper.load_model("large-v3")
 try:
     model.transcribe("/tmp/warm.wav", language="en", fp16=True)
 except:
     pass
 
-# ------- tiny live context -------
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+
+# tiny context buffers for current-line translation only
 recent_src_segments: list[str] = []
 recent_targets: list[str] = []
 MAX_SRC_CTX = 2
 MAX_RECENT = 10
 
-# ------- filters -------
+# exact short interjections only (and standalone "you")
 THANKS_RE = re.compile(
     r"""
     ^\s*
@@ -80,6 +61,8 @@ def is_interjection_thanks(text: str) -> bool:
         return False
     return bool(THANKS_RE.match(text.strip()))
 
+
+# Broad CTA / meta filler (intros, outros, like/subscribe, links, comments, follows, sponsors, merch, goals)
 _CTA_PATTERNS = [
     # --- Intros / greetings (channel meta) ---
     r"(?i)^\s*(?:hey|hi|hello|what'?s\s*up|yo|good\s+(?:morning|afternoon|evening))\s+(?:guys|everyone|everybody|folks|y['’]?all|friends)\b",
@@ -142,7 +125,7 @@ _CTA_PATTERNS = [
     # --- Social follows ---
     r"(?i)\bfollow\s+me\s+on\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\b",
     r"(?i)\b(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\.com\/\w+",
-    r"(?i)\bmy\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\s+is\b",
+    r"(?i)\bmy\s+(?:instagram|tiktok|twitter|x|twitch|facebook|threads)\s+is\b",
 
     # --- Community / membership ---
     r"(?i)\bjoin\s+(?:my|our)\s+discord\b",
@@ -156,21 +139,24 @@ _CTA_PATTERNS = [
     r"(?i)\blet'?s\s+get\s+to\s+\d+\s+likes\b",
     r"(?i)\bhelps?\s+(?:with\s+)?the\s+algorithm\b",
 
-    # --- Captions/credits ---
+    # --- Captions/credits (existing) ---
     r"(?i)\bsubtitles?\s+by\b",
     r"(?i)\bcaptions?\s+by\b",
     r"(?i)\bsubtitled\s+by\b",
     r"(?i)\bclosed\s+captions?\s+by\b",
     r"(?i)\bamara\.org\b",
     r"(?i)\btranscription\s+by\b",
+
+ 
 ]
+
 _CTA_REGEXES = [re.compile(p) for p in _CTA_PATTERNS]
 
 def is_cta_like(text: str) -> bool:
     if not text or len(text.strip()) < 2: return False
     return any(rx.search(text) for rx in _CTA_REGEXES)
 
-# ------- translation  -------
+
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
     recent_target_str = "\n".join(recent_targets[-MAX_RECENT:])
@@ -266,7 +252,10 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
         print("Translation error:", e)
         return ""
 
-# ------- websocket: per-chunk decode + transcribe -------
+@app.get("/")
+async def serve_index():
+    return FileResponse(os.path.join("frontend", "index.html"))
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -275,24 +264,18 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         settings = await websocket.receive_text()
         config = json.loads(settings)
-    except Exception:
-        config = {}
+        direction = config.get("direction")
 
-    direction = config.get("direction")
+        if direction == "en-ja":
+            source_lang, target_lang = "English", "Japanese"
+            whisper_task = "transcribe"
+        elif direction == "ja-en":
+            source_lang, target_lang = "Japanese", "English"
+            whisper_task = "translate"
+        else:
+            await websocket.close()
+            return
 
-    if direction == "en-ja":
-        source_lang, target_lang = "English", "Japanese"
-        whisper_task = "transcribe"
-        lang_code = "en"
-    elif direction == "ja-en":
-        source_lang, target_lang = "Japanese", "English"
-        whisper_task = "translate"
-        lang_code = "ja"
-    else:
-        await websocket.close()
-        return
-
-    try:
         while True:
             msg = await websocket.receive()
             if "bytes" not in msg:
@@ -302,7 +285,6 @@ async def websocket_endpoint(websocket: WebSocket):
             if not audio:
                 continue
 
-            # write .webm, convert to 16k mono wav
             with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as raw:
                 raw.write(audio)
                 raw.flush()
@@ -312,12 +294,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             ["ffmpeg", "-y", "-i", raw.name, "-ar", "16000", "-ac", "1", wav.name],
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True
                         )
-                    except subprocess.CalledProcessError as exc:
-                        err = exc.stderr.decode("utf-8", "ignore") if exc.stderr else ""
-                        print("ffmpeg error:", err.strip()[:400])
+                    except:
                         continue
 
-                    # run Whisper large-v3
                     result = model.transcribe(
                         wav.name,
                         fp16=True,
@@ -326,7 +305,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         condition_on_previous_text=False,
                         hallucination_silence_threshold=0.30,
                         no_speech_threshold=0.6,
-                        language=lang_code,
+                        language="en" if source_lang == "English" else "ja",
                         compression_ratio_threshold=1.7,
                         logprob_threshold=-0.3,
                         task=whisper_task,
@@ -335,10 +314,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     src_text = (result.get("text") or "").strip()
                     if not src_text:
                         continue
-
                     print("ASR:", src_text)
 
-                    # drop low-value lines early
                     if is_interjection_thanks(src_text):
                         print("Skipped short thank-you interjection (source).")
                         continue
@@ -351,7 +328,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if direction == "en-ja":
                         translated = await translate_text(src_text, source_lang, target_lang)
                     else:
-                        translated = src_text  # Whisper already gave English for ja→en
+                        translated = src_text  # Whisper already gave English
 
                     if is_interjection_thanks(translated):
                         print("Skipped short thank-you interjection (target).")
@@ -360,12 +337,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         print("Dropped CTA/meta filler (target).")
                         continue
 
-                    translated = (translated or "").strip()
+                    translated = translated.strip()
                     if not translated or not re.search(r'[A-Za-z0-9ぁ-んァ-ン一-龯々ー]', translated):
                         print("Suppressed empty/no-op output.")
                         continue
 
-                    # update tiny context only when emitting
+                    # update tiny context buffers only when emitting
                     recent_src_segments.append(src_text)
                     if len(recent_src_segments) > MAX_SRC_CTX * 3:
                         recent_src_segments.pop(0)
@@ -378,11 +355,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except Exception as e:
         print("WebSocket error:", e)
-    finally:
-        try: await websocket.close()
-        except: pass
-        print("WebSocket closed")
+        await websocket.close()
 
-# dev entry
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
