@@ -112,9 +112,21 @@
 
         ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
         await ctx.audioWorklet.addModule("/static/pcm-capture.worklet.js");
+
         const source = ctx.createMediaStreamSource(stream);
-        node = new AudioWorkletNode(ctx, "pcm-capture", { processorOptions: { downsampleTo: 16000, frameMs: 20 }});
+        node = new AudioWorkletNode(ctx, "pcm-capture", {
+          processorOptions: { downsampleTo: 16000, frameMs: 20 },
+          numberOfOutputs: 1,
+          outputChannelCount: [1]
+        });
         source.connect(node);
+
+        // keep the worklet pulled by the audio engine (silent path to speakers)
+        const devnull = new GainNode(ctx, { gain: 0 });
+        node.connect(devnull).connect(ctx.destination);
+
+        // make sure the context is actually running
+        if (ctx.state === "suspended") await ctx.resume();
 
         ws = new WebSocket(wsUrl());
         ws.binaryType = "arraybuffer";
@@ -122,7 +134,9 @@
           ws.send(JSON.stringify({ direction: directionSelect.value }));
           setButtons(true);
           setStatus("Streaming…");
-          timer = setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({type:"ping"})); }, 15000);
+          timer = setInterval(() => {
+            if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" }));
+          }, 15000);
         };
         ws.onmessage = (e)=>handleMessage(e.data);
         ws.onclose   = ()=>{ setStatus("Disconnected"); setButtons(false); clearActive(); };
