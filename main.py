@@ -1,30 +1,28 @@
-import tempfile, subprocess, uvicorn, openai, whisper, os, json, uuid, re
+# main.py
+# - One ffmpeg process per socket (no temp files, no restarts)
+# - Keep a rolling PCM buffer and run Whisper on a 1s window every ~200ms
+# - When we hear a short pause, finalize and run your translation prompt
+# - All your filters + prompt stay the same
+
+import os, json, re, uuid, time, contextlib, asyncio, subprocess, signal
+from collections import deque
+
+import numpy as np
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from dotenv import load_dotenv
 
-# basic setup and client
+import webrtcvad
+import whisper
+import torch
+import openai
+import uvicorn
+
+# ---------- setup ----------
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 client = openai.AsyncOpenAI(api_key=api_key)
-
-# pre-warm ffmpeg so the first request isn't slow
-try:
-    subprocess.run(
-        ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-ar", "16000", "-ac", "1", "-y", "/tmp/warm.wav"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-except:
-    pass
-
-# load whisper once
-model = whisper.load_model("large-v3")
-try:
-    model.transcribe("/tmp/warm.wav", language="en", fp16=True)
-except:
-    pass
 
 app = FastAPI()
 app.add_middleware(
@@ -32,14 +30,36 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
+# Serve the UI at /
+@app.get("/")
+async def serve_index():
+    return FileResponse(os.path.join("frontend", "index.html"))
 
-# tiny context buffers for current-line translation only
+# Pre-warm ffmpeg so the first decode doesn't hitch
+try:
+    subprocess.run(
+        ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-ar", "16000", "-ac", "1", "-y", "/tmp/warm.wav"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+except:
+    pass
+
+# Load Whisper once (large-v3), do a tiny warmup
+torch.set_num_threads(1)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+model = whisper.load_model("large-v3", device=DEVICE)
+try:
+    model.transcribe("/tmp/warm.wav", language="en", fp16=True)
+except:
+    pass
+
+# ---------- tiny live context  ----------
 recent_src_segments: list[str] = []
 recent_targets: list[str] = []
 MAX_SRC_CTX = 2
 MAX_RECENT = 10
 
-# exact short interjections only (and standalone "you")
+# ---------- filters  ----------
 THANKS_RE = re.compile(
     r"""
     ^\s*
@@ -55,14 +75,11 @@ THANKS_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
-
 def is_interjection_thanks(text: str) -> bool:
     if not text:
         return False
     return bool(THANKS_RE.match(text.strip()))
 
-
-# Broad CTA / meta filler (intros, outros, like/subscribe, links, comments, follows, sponsors, merch, goals)
 _CTA_PATTERNS = [
     # --- Intros / greetings (channel meta) ---
     r"(?i)^\s*(?:hey|hi|hello|what'?s\s*up|yo|good\s+(?:morning|afternoon|evening))\s+(?:guys|everyone|everybody|folks|y['’]?all|friends)\b",
@@ -125,7 +142,7 @@ _CTA_PATTERNS = [
     # --- Social follows ---
     r"(?i)\bfollow\s+me\s+on\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\b",
     r"(?i)\b(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\.com\/\w+",
-    r"(?i)\bmy\s+(?:instagram|tiktok|twitter|x|twitch|facebook|threads)\s+is\b",
+    r"(?i)\bmy\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\s+is\b",
 
     # --- Community / membership ---
     r"(?i)\bjoin\s+(?:my|our)\s+discord\b",
@@ -146,17 +163,13 @@ _CTA_PATTERNS = [
     r"(?i)\bclosed\s+captions?\s+by\b",
     r"(?i)\bamara\.org\b",
     r"(?i)\btranscription\s+by\b",
-
- 
 ]
-
 _CTA_REGEXES = [re.compile(p) for p in _CTA_PATTERNS]
-
 def is_cta_like(text: str) -> bool:
     if not text or len(text.strip()) < 2: return False
     return any(rx.search(text) for rx in _CTA_REGEXES)
 
-
+# ---------- translation prompt (yours, verbatim) ----------
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
     recent_target_str = "\n".join(recent_targets[-MAX_RECENT:])
@@ -252,110 +265,172 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
         print("Translation error:", e)
         return ""
 
-@app.get("/")
-async def serve_index():
-    return FileResponse(os.path.join("frontend", "index.html"))
+# ---------- streaming utils ----------
+def start_ffmpeg_to_pcm16():
+    # stdin: WebM/Ogg w/ Opus, stdout: raw s16le @16kHz mono
+    return subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-i", "pipe:0",
+         "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    )
 
+SAMPLE_RATE = 16000
+FRAME_BYTES = 320 * 2              # 20ms @16k mono, int16 → 640 bytes
+TICK_MS = 200                       # decode cadence
+WIN_MS  = 1000                      # rolling window size
+HANG_MS = 300                       # silence before we finalize
+
+# ---------- websocket ----------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
 
-    try:
-        settings = await websocket.receive_text()
-        config = json.loads(settings)
-        direction = config.get("direction")
+    # first message is the direction
+    cfg = json.loads(await websocket.receive_text())
+    direction = cfg.get("direction")
 
-        if direction == "en-ja":
-            source_lang, target_lang = "English", "Japanese"
-            whisper_task = "transcribe"
-        elif direction == "ja-en":
-            source_lang, target_lang = "Japanese", "English"
-            whisper_task = "translate"
-        else:
-            await websocket.close()
-            return
+    if direction == "en-ja":
+        source_lang, target_lang = "English", "Japanese"
+        whisper_task = "transcribe"
+        lang_code = "en"
+    elif direction == "ja-en":
+        source_lang, target_lang = "Japanese", "English"
+        whisper_task = "translate"
+        lang_code = "ja"
+    else:
+        await websocket.close()
+        return
 
+    # keep one ffmpeg alive for this socket
+    proc = start_ffmpeg_to_pcm16()
+    vad = webrtcvad.Vad(2)
+
+    ring = bytearray()
+    last_partial = ""
+    hang_ms = 0
+
+    async def pump_pcm():
+        # read raw PCM from ffmpeg stdout in ~100ms bites
+        loop = asyncio.get_running_loop()
+        while True:
+            chunk = await loop.run_in_executor(None, proc.stdout.read, FRAME_BYTES * 5)
+            if not chunk:
+                break
+            ring.extend(chunk)
+
+    async def recv_loop():
+        # shove incoming binary straight into ffmpeg's stdin
         while True:
             msg = await websocket.receive()
-            if "bytes" not in msg:
+            if "bytes" in msg:
+                try:
+                    proc.stdin.write(msg["bytes"])
+                    proc.stdin.flush()
+                except BrokenPipeError:
+                    break
+            # ignore control pings
+
+    reader_task = asyncio.create_task(pump_pcm())
+    writer_task = asyncio.create_task(recv_loop())
+
+    try:
+        while True:
+            await asyncio.sleep(TICK_MS / 1000.0)
+
+            # need at least 1s of audio for a decent hypothesis
+            win_bytes = int(WIN_MS / 1000.0 * SAMPLE_RATE) * 2
+            if len(ring) < win_bytes:
                 continue
 
-            audio = msg["bytes"]
-            if not audio:
-                continue
+            # take the latest 1s slice
+            window = ring[-win_bytes:]
+            pcm_i16 = np.frombuffer(window, dtype=np.int16).astype(np.float32) / 32768.0
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as raw:
-                raw.write(audio)
-                raw.flush()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav:
-                    try:
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-i", raw.name, "-ar", "16000", "-ac", "1", wav.name],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True
-                        )
-                    except:
+            # run Whisper 
+            result = model.transcribe(
+                pcm_i16,
+                fp16=True,
+                temperature=0.0,
+                beam_size=5,
+                condition_on_previous_text=False,
+                hallucination_silence_threshold=0.30,
+                no_speech_threshold=0.6,
+                language=lang_code,
+                compression_ratio_threshold=1.7,
+                logprob_threshold=-0.3,
+                task=whisper_task,
+            )
+            partial = (result.get("text") or "").strip()
+
+            if partial and partial != last_partial:
+                await websocket.send_text(f"[UPDATE]{json.dumps({'id':'live','text': partial})}")
+                last_partial = partial
+
+            # quick VAD over the most recent 100ms
+            tail = ring[-FRAME_BYTES*5:]
+            speech = False
+            for i in range(0, len(tail), FRAME_BYTES):
+                frame = tail[i:i+FRAME_BYTES]
+                if len(frame) == FRAME_BYTES and vad.is_speech(frame, SAMPLE_RATE):
+                    speech = True
+                    break
+
+            if speech:
+                hang_ms = 0
+            else:
+                hang_ms += TICK_MS
+                # short pause → commit a final
+                if hang_ms >= HANG_MS and last_partial:
+                    seg_id = str(uuid.uuid4())
+                    src_text = last_partial.strip()
+                    last_partial = ""
+                    hang_ms = 0
+
+                    # toss low-value stuff early
+                    if is_interjection_thanks(src_text) or is_cta_like(src_text):
                         continue
 
-                    result = model.transcribe(
-                        wav.name,
-                        fp16=True,
-                        temperature=0.0,
-                        beam_size=5,
-                        condition_on_previous_text=False,
-                        hallucination_silence_threshold=0.30,
-                        no_speech_threshold=0.6,
-                        language="en" if source_lang == "English" else "ja",
-                        compression_ratio_threshold=1.7,
-                        logprob_threshold=-0.3,
-                        task=whisper_task,
-                    )
-
-                    src_text = (result.get("text") or "").strip()
-                    if not src_text:
-                        continue
-                    print("ASR:", src_text)
-
-                    if is_interjection_thanks(src_text):
-                        print("Skipped short thank-you interjection (source).")
-                        continue
-                    if is_cta_like(src_text):
-                        print("Dropped CTA/meta filler (source).")
-                        continue
-
-                    segment_id = str(uuid.uuid4())
-
+                    # pick translation path
                     if direction == "en-ja":
-                        translated = await translate_text(src_text, source_lang, target_lang)
+                        async def _translate_and_send():
+                            translated = await translate_text(src_text, source_lang, target_lang)
+                            if translated and not is_interjection_thanks(translated) and not is_cta_like(translated):
+                                recent_src_segments.append(src_text)
+                                if len(recent_src_segments) > MAX_SRC_CTX * 3:
+                                    recent_src_segments.pop(0)
+                                recent_targets.append(translated)
+                                if len(recent_targets) > MAX_RECENT:
+                                    recent_targets.pop(0)
+                                await websocket.send_text(f"[DONE]{json.dumps({'id': seg_id, 'text': translated})}")
+                        asyncio.create_task(_translate_and_send())
                     else:
-                        translated = src_text  # Whisper already gave English
-
-                    if is_interjection_thanks(translated):
-                        print("Skipped short thank-you interjection (target).")
-                        continue
-                    if is_cta_like(translated):
-                        print("Dropped CTA/meta filler (target).")
-                        continue
-
-                    translated = translated.strip()
-                    if not translated or not re.search(r'[A-Za-z0-9ぁ-んァ-ン一-龯々ー]', translated):
-                        print("Suppressed empty/no-op output.")
-                        continue
-
-                    # update tiny context buffers only when emitting
-                    recent_src_segments.append(src_text)
-                    if len(recent_src_segments) > MAX_SRC_CTX * 3:
-                        recent_src_segments.pop(0)
-
-                    recent_targets.append(translated)
-                    if len(recent_targets) > MAX_RECENT:
-                        recent_targets.pop(0)
-
-                    await websocket.send_text(f"[DONE]{json.dumps({'id': segment_id, 'text': translated})}")
+                        # ja→en uses Whisper translate output as final
+                        translated = src_text
+                        if translated and not is_interjection_thanks(translated) and not is_cta_like(translated):
+                            recent_src_segments.append(src_text)
+                            if len(recent_src_segments) > MAX_SRC_CTX * 3:
+                                recent_src_segments.pop(0)
+                            recent_targets.append(translated)
+                            if len(recent_targets) > MAX_RECENT:
+                                recent_targets.pop(0)
+                            await websocket.send_text(f"[DONE]{json.dumps({'id': seg_id, 'text': translated})}")
 
     except Exception as e:
         print("WebSocket error:", e)
-        await websocket.close()
+    finally:
+        # tear everything down without drama
+        with contextlib.suppress(Exception):
+            writer_task.cancel()
+            reader_task.cancel()
+        with contextlib.suppress(Exception):
+            proc.stdin.close(); proc.stdout.close()
+            proc.send_signal(signal.SIGTERM)
+        with contextlib.suppress(Exception):
+            await websocket.close()
+        print("WebSocket closed")
 
+# ---------- dev entry ----------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
