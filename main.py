@@ -1,7 +1,6 @@
 # main.py
 # - Browser sends raw 16 kHz Int16 PCM frames over WS
-# - Keep a rolling PCM buffer and run Whisper on a short window every tick
-# - Finalize on a brief pause and run your translation prompt
+# - Rolling window decode; finalize on brief pause
 # - Whisper settings + filters + prompt remain the same
 
 import os, json, re, uuid, time, contextlib, asyncio, subprocess
@@ -39,7 +38,7 @@ async def serve_index():
 # Serve the worklet at /static/pcm-capture.worklet.js
 app.mount("/static", StaticFiles(directory="frontend"), name="static")
 
-# Pre-warm ffmpeg only to generate a tiny wav for Whisper warmup (kept as-is)
+# Pre-warm ffmpeg only to generate a tiny wav for Whisper warmup 
 try:
     subprocess.run(
         ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-ar", "16000", "-ac", "1", "-y", "/tmp/warm.wav"],
@@ -48,7 +47,7 @@ try:
 except:
     pass
 
-# Load Whisper once (large-v3), do a tiny warmup (kept as-is)
+# Load Whisper once (large-v3), tiny warmup 
 torch.set_num_threads(1)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 model = whisper.load_model("large-v3", device=DEVICE)
@@ -90,7 +89,6 @@ _CTA_PATTERNS = [
     r"(?i)\bwelcome\s+(?:back\s+)?to\s+my\s+channel\b",
     r"(?i)\bwelcome\s+(?:back\s+)?(?:everyone|guys|y['’]?all|friends)\b",
     r"(?i)\bthanks?\s+for\s+joining\s+(?:me|us)\b",
-
     # --- Like / comment / subscribe combos ---
     r"(?i)\blike\s*(?:,?\s*comment\s*)?(?:,?\s*and\s*)?subscribe\b",
     r"(?i)\bsubscribe\s*(?:,?\s*and\s*)?(?:like|comment)\b",
@@ -101,35 +99,30 @@ _CTA_PATTERNS = [
     r"(?i)\bsubscribe\s+(?:for|to)\s+more\b",
     r"(?i)\bsubscribe\s+now\b",
     r"(?i)\bhelp\s+(?:the\s+)?channel\s+by\s+(?:liking|subscribing)\b",
-
     # --- Notifications ---
     r"(?i)\b(?:ring|hit|tap|click)\s+(?:the\s+)?(?:notification\s+)?bell\b",
     r"(?i)\bturn\s+on\s+(?:the\s+)?notifications?\b",
     r"(?i)\benable\s+(?:post\s+)?notifications?\b",
     r"(?i)\bdon'?t\s+forget\s+(?:to\s+)?(?:like|comment|share|subscribe|turn\s+on\s+notifications?)\b",
-
     # --- Share / links / description ---
     r"(?i)\bshare\s+(?:this|the)\s+(?:video|stream|clip|content|tutorial)\b",
     r"(?i)\bplease\s+share\b",
     r"(?i)\b(?:link|links?)\s+in\s+(?:the\s+)?(?:bio|description|comments?)\b",
     r"(?i)\bcheck\s+(?:the\s+)?link\s+(?:below|above)\b",
     r"(?i)\bmore\s+info\s+in\s+(?:the\s+)?description\b",
-
     # --- Comment prompts ---
     r"(?i)\b(?:leave|drop|post)\s+(?:a|your)?\s*comment[s]?\b",
     r"(?i)\bcomment\s+(?:below|down\s+below)\b",
     r"(?i)\btell\s+me\s+in\s+the\s+comments?\b",
     r"(?i)\bwhat\s+do\s+you\s+think\s+in\s+the\s+comments?\b",
-
     # --- Outros / closings ---
     r"(?i)\bthanks?\s+for\s+(?:watching|tuning\s+in|coming\s+by|listening)\b",
     r"(?i)\bthank\s+you\s+for\s+(?:watching|tuning\s+in|coming\s+by|listening)\b",
-    r"(?i)\bsee\s+you\s+(?:次\s*time|tomorrow|soon|in\s+the\s+next(?:\s+one|video)?)\b",
+    r"(?i)\bsee\s+you\s+(?:next\s*time|tomorrow|soon|in\s+the\s+next(?:\s+one|video)?)\b",
     r"(?i)\bthat'?s\s+(?:it|all)(?:\s+for\s+(?:today|now))?\b",
     r"(?i)\bcatch\s+you\s+later\b",
     r"(?i)\bpeace\s+out\b",
     r"(?i)\btake\s+care\b",
-
     # --- Sponsorship / affiliate / support ---
     r"(?i)\bthis\s+video\s+is\s+sponsored\s+by\b",
     r"(?i)\b(?:sponsor(?:ed)?|partner(?:ed)?)\s+(?:with|by)\b",
@@ -142,24 +135,20 @@ _CTA_PATTERNS = [
     r"(?i)\bbuy\s+me\s+a\s+coffee\b",
     r"(?i)\bmy\s+merch\b",
     r"(?i)\bmerch(?:andise)?\s+link\b",
-
     # --- Social follows ---
     r"(?i)\bfollow\s+me\s+on\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\b",
     r"(?i)\b(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\.com\/\w+",
     r"(?i)\bmy\s+(?:instagram|tiktok|twitter|x|twitch|youtube|facebook|threads)\s+is\b",
-
     # --- Community / membership ---
     r"(?i)\bjoin\s+(?:my|our)\s+discord\b",
     r"(?i)\bdiscord\.gg\/?[A-Za-z0-9]+",
     r"(?i)\bjoin\s+(?:the\s+)?channel\s+as\s+a\s+member\b",
     r"(?i)\bbecome\s+a\s+member\b",
-
     # --- Giveaways / goals / algorithm meta ---
     r"(?i)\bgiveaway\b",
     r"(?i)\blike\s+goal\b",
     r"(?i)\blet'?s\s+get\s+to\s+\d+\s+likes\b",
     r"(?i)\bhelps?\s+(?:with\s+)?the\s+algorithm\b",
-
     # --- Captions/credits  ---
     r"(?i)\bsubtitles?\s+by\b",
     r"(?i)\bcaptions?\s+by\b",
@@ -173,7 +162,7 @@ def is_cta_like(text: str) -> bool:
     if not text or len(text.strip()) < 2: return False
     return any(rx.search(text) for rx in _CTA_REGEXES)
 
-# ---------- translation prompt----------
+# ---------- translation prompt ----------
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
     recent_target_str = "\n".join(recent_targets[-MAX_RECENT:])
@@ -272,9 +261,9 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
 # ---------- streaming constants ----------
 SAMPLE_RATE = 16000
 FRAME_BYTES = 320 * 2              # 20ms @16k mono, int16 → 640 bytes
-TICK_MS = 200                       # decode cadence
-WIN_MS  = 1000                      # rolling window size
-HANG_MS = 300                       # silence before we finalize
+TICK_MS = 200
+WIN_MS  = 1000
+HANG_MS = 300
 
 # ---------- websocket ----------
 @app.websocket("/ws")
@@ -308,12 +297,20 @@ async def websocket_endpoint(websocket: WebSocket):
     ring_max   = win_bytes * 3              # cap buffer to ~3s so slices stay cheap
     tail_bytes = FRAME_BYTES * 5            # 100ms for quick VAD
 
+    # --- instrumentation ---
+    last_bytes_log = 0
+    bytes_since_log = 0
+    last_audio_ts = time.time()
+
     async def recv_loop():
-        nonlocal ring
+        nonlocal ring, bytes_since_log, last_audio_ts
         while True:
             msg = await websocket.receive()
-            if "bytes" in msg:
-                ring.extend(msg["bytes"])
+            if "bytes" in msg and msg["bytes"]:
+                b = msg["bytes"]
+                ring.extend(b)
+                bytes_since_log += len(b)
+                last_audio_ts = time.time()
                 # keep buffer bounded
                 if len(ring) > ring_max:
                     del ring[:len(ring) - ring_max]
@@ -324,6 +321,17 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             await asyncio.sleep(TICK_MS / 1000.0)
+
+            # periodic byte counter so you can see audio flow
+            now = time.time()
+            if now - last_bytes_log >= 0.5:
+                if bytes_since_log:
+                    print(f"WS bytes: +{bytes_since_log} (ring={len(ring)} bytes, ~{len(ring)/2/SAMPLE_RATE*1000:.0f} ms)")
+                    bytes_since_log = 0
+                if now - last_audio_ts > 2.0:
+                    print("⚠️  No audio arriving for >2s (check mic/worklet/HTTPS).")
+                    last_audio_ts = now  # avoid spamming
+                last_bytes_log = now
 
             if len(ring) < win_bytes:
                 continue
