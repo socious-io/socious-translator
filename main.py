@@ -1,5 +1,5 @@
 # main.py
-# - Browser sends raw 16 kHz Int16 PCM frames over WS (no decoding needed here)
+# - Browser sends raw 16 kHz Int16 PCM frames over WS
 # - Keep a rolling PCM buffer and run Whisper on a short window every tick
 # - Finalize on a brief pause and run your translation prompt
 # - Whisper settings + filters + prompt remain the same
@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles  # serve /static for the worklet
 
 import webrtcvad
 import whisper
@@ -35,7 +36,10 @@ app.add_middleware(
 async def serve_index():
     return FileResponse(os.path.join("frontend", "index.html"))
 
-# Pre-warm ffmpeg only to generate a tiny wav for Whisper warmup 
+# Serve the worklet at /static/pcm-capture.worklet.js
+app.mount("/static", StaticFiles(directory="frontend"), name="static")
+
+# Pre-warm ffmpeg only to generate a tiny wav for Whisper warmup (kept as-is)
 try:
     subprocess.run(
         ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-ar", "16000", "-ac", "1", "-y", "/tmp/warm.wav"],
@@ -44,7 +48,7 @@ try:
 except:
     pass
 
-# Load Whisper once (large-v3), do a tiny warmup 
+# Load Whisper once (large-v3), do a tiny warmup (kept as-is)
 torch.set_num_threads(1)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 model = whisper.load_model("large-v3", device=DEVICE)
@@ -120,7 +124,7 @@ _CTA_PATTERNS = [
     # --- Outros / closings ---
     r"(?i)\bthanks?\s+for\s+(?:watching|tuning\s+in|coming\s+by|listening)\b",
     r"(?i)\bthank\s+you\s+for\s+(?:watching|tuning\s+in|coming\s+by|listening)\b",
-    r"(?i)\bsee\s+you\s+(?:next\s*time|tomorrow|soon|in\s+the\s+next(?:\s+one|video)?)\b",
+    r"(?i)\bsee\s+you\s+(?:次\s*time|tomorrow|soon|in\s+the\s+next(?:\s+one|video)?)\b",
     r"(?i)\bthat'?s\s+(?:it|all)(?:\s+for\s+(?:today|now))?\b",
     r"(?i)\bcatch\s+you\s+later\b",
     r"(?i)\bpeace\s+out\b",
@@ -169,7 +173,7 @@ def is_cta_like(text: str) -> bool:
     if not text or len(text.strip()) < 2: return False
     return any(rx.search(text) for rx in _CTA_REGEXES)
 
-# ---------- translation prompt  ----------
+# ---------- translation prompt----------
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
     recent_target_str = "\n".join(recent_targets[-MAX_RECENT:])
@@ -265,12 +269,12 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
         print("Translation error:", e)
         return ""
 
-# ---------- streaming constants  ----------
+# ---------- streaming constants ----------
 SAMPLE_RATE = 16000
 FRAME_BYTES = 320 * 2              # 20ms @16k mono, int16 → 640 bytes
-TICK_MS = 150                       # decode cadence (snappier)
-WIN_MS  = 800                       # rolling window size
-HANG_MS = 250                       # silence before we finalize
+TICK_MS = 200                       # decode cadence
+WIN_MS  = 1000                      # rolling window size
+HANG_MS = 300                       # silence before we finalize
 
 # ---------- websocket ----------
 @app.websocket("/ws")
@@ -278,7 +282,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
 
-    # first message is the direction (kept as-is)
+    # first message is the direction
     cfg = json.loads(await websocket.receive_text())
     direction = cfg.get("direction")
 
@@ -348,6 +352,7 @@ async def websocket_endpoint(websocket: WebSocket):
             partial = (result.get("text") or "").strip()
 
             if partial and partial != last_partial:
+                print(f"ASR(partial): {partial}")
                 await websocket.send_text(f"[UPDATE]{json.dumps({'id':'live','text': partial})}")
                 last_partial = partial
 
@@ -370,14 +375,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     last_partial = ""
                     hang_ms = 0
 
-                    # toss low-value stuff early (kept as-is)
+                    # toss low-value stuff early
                     if is_interjection_thanks(src_text) or is_cta_like(src_text):
                         continue
+
+                    print(f"ASR(final): {src_text}")
 
                     if direction == "en-ja":
                         async def _translate_and_send():
                             translated = await translate_text(src_text, source_lang, target_lang)
                             if translated and not is_interjection_thanks(translated) and not is_cta_like(translated):
+                                print(f"Translation: {translated}")
                                 recent_src_segments.append(src_text)
                                 if len(recent_src_segments) > MAX_SRC_CTX * 3:
                                     recent_src_segments.pop(0)
@@ -390,6 +398,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         # ja→en uses Whisper translate output as final
                         translated = src_text
                         if translated and not is_interjection_thanks(translated) and not is_cta_like(translated):
+                            print(f"Translation: {translated}")
                             recent_src_segments.append(src_text)
                             if len(recent_src_segments) > MAX_SRC_CTX * 3:
                                 recent_src_segments.pop(0)
