@@ -13,7 +13,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles  # serve /static for the worklet
 
-import webrtcvad
+try:
+    import webrtcvad as _webrtcvad
+    VAD_AVAILABLE = True
+    print("✅ webrtcvad loaded")
+except Exception as e:
+    _webrtcvad = None
+    VAD_AVAILABLE = False
+    print("⚠️ webrtcvad import failed:", e)
+
 import whisper
 import torch
 import openai
@@ -29,6 +37,17 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
+
+class EnergyVAD:
+    def __init__(self, thr_i16=450): self.thr = float(thr_i16)
+    def is_speech(self, frame_bytes, sample_rate):
+        import numpy as _np
+        pcm = _np.frombuffer(frame_bytes, dtype=_np.int16).astype(_np.float32)
+        if pcm.size == 0: return False
+        return float(_np.sqrt(_np.mean(pcm * pcm))) > self.thr
+
+def make_vad(mode=2):
+    return _webrtcvad.Vad(mode) if VAD_AVAILABLE else EnergyVAD()
 
 # Serve the UI at /
 @app.get("/")
@@ -270,6 +289,9 @@ HANG_MS = 300
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
+
+    vad = make_vad(2)
+    print("Using", "WebRTC VAD" if VAD_AVAILABLE else "Energy VAD (fallback)")
 
     # first message is the direction
     cfg = json.loads(await websocket.receive_text())
