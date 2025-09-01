@@ -1,4 +1,3 @@
-# main.py
 import os, json, re, uuid, time, contextlib, asyncio, subprocess, signal, sys
 import numpy as np
 from dotenv import load_dotenv
@@ -44,7 +43,7 @@ try:
 except:
     pass
 
-# ---- your filters ----
+# ----filters ----
 THANKS_RE = re.compile(r"""^\s*(?:(?:thank\s*(?:you|u)|thanks|thanx|thx|tks|ty|tysm|tyvm|many\s*thanks|much\s*thanks|much\s*appreciated|appreciate\s*it|cheers|ta|nice\s*one)(?:\s*(?:so\s*much|very\s*much|a\s*lot|everyone|everybody|all|y['’]?all|guys|folks|team))?|you)\s*[!.…😊🙏💖✨👏👍]*\s*$""", re.I)
 def is_interjection_thanks(t:str)->bool: return bool(t and THANKS_RE.match(t.strip()))
 
@@ -62,7 +61,7 @@ _CTA_PATTERNS = [
     r"(?i)\bsubscribe\s+(?:for|to)\s+more\b",
     r"(?i)\bsubscribe\s+now\b",
     r"(?i)\bhelp\s+(?:the\s+)?channel\s+by\s+(?:liking|subscribing)\b",
-    r"(?i)\b(?:ring|hit|tap|click)\s+(?:the\s+)?(?:notification\s+)?bell\b",
+    r"(?i)\b(?:ring|hit|tap)\s+(?:the\s+)?(?:notification\s+)?bell\b",
     r"(?i)\bturn\s+on\s+(?:the\s+)?notifications?\b",
     r"(?i)\benable\s+(?:post\s+)?notifications?\b",
     r"(?i)\bdon'?t\s+forget\s+(?:to\s+)?(?:like|comment|share|subscribe|turn\s+on\s+notifications?)\b",
@@ -209,9 +208,9 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
         print("Translation error:", e)
         return ""
 
-# ---- ffmpeg helper (now takes input format, adds streaming flags, logs stderr) ----
+# ---- ffmpeg helper (now accepts webm/ogg/mp4) ----
 def start_ffmpeg_to_pcm16(fmt: str | None):
-    # fmt is "webm" or "ogg" (from client). Hint ffmpeg so it demuxes correctly.
+    # fmt is "webm", "ogg", or "mp4" (from client). Hint ffmpeg so it demuxes correctly.
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -224,6 +223,8 @@ def start_ffmpeg_to_pcm16(fmt: str | None):
         cmd += ["-f", "webm", "-i", "pipe:0"]
     elif fmt == "ogg":
         cmd += ["-f", "ogg", "-i", "pipe:0"]
+    elif fmt == "mp4":
+        cmd += ["-f", "mp4", "-i", "pipe:0"]
     else:
         cmd += ["-i", "pipe:0"]
     cmd += [
@@ -252,7 +253,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         cfg = {}
     direction = cfg.get("direction", "en-ja")
-    in_format = (cfg.get("format") or "").lower()  # "webm" | "ogg" | ""
+    in_format = (cfg.get("format") or "").lower()  # "webm" | "ogg" | "mp4" | ""
 
     if direction == "en-ja":
         source_lang, target_lang = "English", "Japanese"
@@ -266,7 +267,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    proc = start_ffmpeg_to_pcm16(in_format if in_format in ("webm","ogg") else None)
+    proc = start_ffmpeg_to_pcm16(in_format if in_format in ("webm","ogg","mp4") else None)
     vad = webrtcvad.Vad(2)
 
     ring = bytearray()

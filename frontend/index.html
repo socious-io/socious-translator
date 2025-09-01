@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Socious Translator (Whisper large-v3)</title>
+  <title>Socious Translator</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     body { font-family: Inter, "Helvetica Neue", Arial, sans-serif; }
@@ -41,7 +41,11 @@
     </div>
   </div>
 
-  <script type="module">
+  <!-- switched from type="module" to a classic script for Safari robustness -->
+  <script defer>
+  (function () {
+    'use strict';
+
     const startBtn = document.getElementById("startBtn");
     const stopBtn  = document.getElementById("stopBtn");
     const directionSelect = document.getElementById("direction");
@@ -49,34 +53,36 @@
     const active    = document.getElementById("active");
     const statusEl  = document.getElementById("status");
 
-    let ws, stream, recorder, pingTimer;
+    let ws, stream, recorder, pingTimer, chunkCount = 0, chunkWatchdog;
     const MAX_CHARS = 400;
 
-    const wsUrl = () => (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws";
-    const setButtons = (running) => {
+    function wsUrl(){ return (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws"; }
+    function setButtons(running){
       startBtn.disabled = running; stopBtn.disabled = !running;
       startBtn.classList.toggle("opacity-50", running);
       startBtn.classList.toggle("cursor-not-allowed", running);
       stopBtn.classList.toggle("opacity-50", !running);
       stopBtn.classList.toggle("cursor-not-allowed", !running);
-    };
-    const setStatus = (t) => statusEl.textContent = t || "";
-    const setActive = (t) => { if (active.textContent !== t) active.textContent = t; active.classList.toggle("caret", !!t); };
-    const clearActive = () => setActive("");
-
-    function trimToMax() {
-      while (committed.innerText.length > MAX_CHARS && committed.firstElementChild) committed.removeChild(committed.firstElementChild);
     }
-    function commit(text, id=null) {
+    function setStatus(t){ statusEl.textContent = t || ""; }
+    function setActive(t){ if (active.textContent !== t) active.textContent = t; active.classList.toggle("caret", !!t); }
+    function clearActive(){ setActive(""); }
+
+    function trimToMax(){
+      while (committed.innerText.length > MAX_CHARS && committed.firstElementChild) {
+        committed.removeChild(committed.firstElementChild);
+      }
+    }
+    function commit(text, id){
       const span = document.createElement("span");
       span.className = "seg";
       if (id) span.dataset.id = id;
       span.textContent = (text || "").trim();
       committed.appendChild(span);
       trimToMax();
-      requestAnimationFrame(() => { window.scrollTo({ top: document.body.scrollHeight }); });
+      requestAnimationFrame(()=>{ window.scrollTo({ top: document.body.scrollHeight }); });
     }
-    function handleMessage(data) {
+    function handleMessage(data){
       if (typeof data !== "string") return;
       try {
         if (data.startsWith("[UPDATE]")) {
@@ -86,66 +92,124 @@
         }
         if (data.startsWith("[DONE]")) {
           const { id, text } = JSON.parse(data.slice(6));
-          clearActive();
-          commit(text || "", id);
-          return;
+          clearActive(); commit(text || "", id); return;
         }
-      } catch(e) { console.warn("parse error", e); }
+      } catch(e){ console.warn("parse error", e); }
     }
 
-    directionSelect.onchange = () => stopRecording();
+    directionSelect.onchange = ()=> stopRecording();
 
-    async function startRecording() {
+    // Prefer Ogg (Firefox), then WebM, then MP4 (Safari)
+    function pickCandidates(){
+      return [
+        "audio/ogg;codecs=opus",
+        "audio/ogg",
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4;codecs=mp4a.40.2",
+        "audio/mp4"
+      ];
+    }
+
+    async function makeRecorder(stream){
+      const candidates = pickCandidates();
+      for (const t of candidates) {
+        try {
+          if (window.MediaRecorder && typeof MediaRecorder.isTypeSupported === "function" && MediaRecorder.isTypeSupported(t)) {
+            return new MediaRecorder(stream, { mimeType: t }); // no bitrate: steadier on Firefox
+          }
+        } catch(_) {}
+      }
+      // Fallback: let the browser choose a default
+      return new MediaRecorder(stream);
+    }
+
+    function mimeToFormat(m){
+      const mm = (m || "").toLowerCase();
+      if (mm.indexOf("ogg")  >= 0) return "ogg";
+      if (mm.indexOf("webm") >= 0) return "webm";
+      if (mm.indexOf("mp4")  >= 0) return "mp4";
+      return "";
+    }
+
+    async function startRecording(){
       try {
         setStatus("Requesting mic…");
         stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
         });
 
-        // Pick MIME BEFORE opening WS so we can tell the server the right demux format
-        const candidates = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/webm"];
-        let mime = "";
-        for (const t of candidates) if (MediaRecorder.isTypeSupported(t)) { mime = t; break; }
-        if (!mime) throw new Error("No supported MediaRecorder mime type (WebM/Opus).");
-        const format = mime.includes("ogg") ? "ogg" : "webm";
-
         ws = new WebSocket(wsUrl());
         ws.binaryType = "arraybuffer";
-        ws.onopen = () => {
-          // first message tells direction + container format
+
+        ws.onopen = async () => {
+          recorder = await makeRecorder(stream);
+          const chosenMime = recorder.mimeType || "";
+          const format = mimeToFormat(chosenMime);
+
+          // tell server which container to expect
           ws.send(JSON.stringify({ direction: directionSelect.value, format }));
           setButtons(true);
-          setStatus("Streaming…");
-          pingTimer = setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 15000);
+          setStatus("Streaming… " + (chosenMime ? `[${chosenMime}]` : ""));
 
-          // start recorder AFTER the server is ready
-          recorder = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 128000 });
-          recorder.ondataavailable = async (e) => {
-            if (e.data && e.data.size > 0 && ws?.readyState === 1) {
-              const buf = await e.data.arrayBuffer();
-              ws.send(buf);
+          chunkCount = 0;
+          if (chunkWatchdog) clearTimeout(chunkWatchdog);
+          chunkWatchdog = setTimeout(()=>{
+            if (chunkCount === 0) {
+              setStatus("No audio chunks yet — increasing slice…");
+              try { if (recorder && recorder.state === "recording") recorder.stop(); } catch {}
+              // restart with a larger slice
+              startChunks(1000);
             }
-          };
-          recorder.start(200); // ~200 ms chunks
+          }, 3000);
+
+          recorder.addEventListener("error", e=>{
+            console.error("Recorder error", e);
+            setStatus("Recorder error: " + (e.error && e.error.message || e.message || "unknown"));
+          });
+
+          function startChunks(sliceMs){
+            try {
+              recorder.ondataavailable = async (e) => {
+                if (!e.data || e.data.size === 0) return;
+                chunkCount++;
+                const buf = await e.data.arrayBuffer();
+                if (ws && ws.readyState === 1) ws.send(buf);
+              };
+              recorder.start(sliceMs); // 500–1000ms tends to be most robust
+            } catch (err){
+              console.error("startChunks error", err);
+              setStatus("Recorder start failed: " + (err && err.message || err));
+            }
+          }
+
+          startChunks(500);
+
+          pingTimer = setInterval(()=>{
+            if (ws && ws.readyState === 1) {
+              try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
+            }
+          }, 15000);
         };
+
         ws.onmessage = (e)=>handleMessage(e.data);
         ws.onclose   = ()=>{ setStatus("Disconnected"); setButtons(false); clearActive(); };
         ws.onerror   = (e)=>{ console.error(e); setStatus("WebSocket error"); };
-      } catch (err) {
+
+      } catch (err){
         console.error(err);
-        setStatus(err?.message || "Mic error");
+        setStatus(err && err.message ? err.message : "Mic error");
         stopRecording();
       }
     }
 
-    function stopRecording() {
-      try { clearInterval(pingTimer); } catch {}
-      try { recorder && recorder.state !== "inactive" && recorder.stop(); } catch {}
-      try { stream?.getTracks().forEach(t=>t.stop()); } catch {}
-      try { ws && ws.readyState === 1 && ws.close(); } catch {}
-      setButtons(false);
-      clearActive();
-      setStatus("");
+    function stopRecording(){
+      try { if (chunkWatchdog) clearTimeout(chunkWatchdog); } catch {}
+      try { if (pingTimer) clearInterval(pingTimer); } catch {}
+      try { if (recorder && recorder.state !== "inactive") recorder.stop(); } catch {}
+      try { if (stream) stream.getTracks().forEach(t=>t.stop()); } catch {}
+      try { if (ws && ws.readyState === 1) ws.close(); } catch {}
+      setButtons(false); clearActive(); setStatus("");
     }
 
     startBtn.onclick = startRecording;
@@ -154,6 +218,11 @@
     if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
       setStatus("Tip: Microphone requires HTTPS or localhost.");
     }
+
+    // Surface real JS errors (useful on Safari)
+    window.addEventListener('error',  (e)=> setStatus("JS error: " + (e.message || (e.error && e.error.message) || "unknown")));
+    window.addEventListener('unhandledrejection', (e)=> setStatus("Promise error: " + (e.reason && e.reason.message || e.reason || "unknown")));
+  })();
   </script>
 </body>
 </html>
