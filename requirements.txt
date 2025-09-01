@@ -6,11 +6,11 @@ uvicorn[standard]>=0.30
 openai>=1.30
 
 # Whisper (OpenAI’s)
-openai-whisper>=20231117
+openai-whisper>=20231117 
 
 # Utils
 python-dotenv>=1.0
 
 numpy>=1.26
-webrtcvad-wheels>=2.0.12
+webrtcvad-wheels>=2.0.14
 tqdm>=4.66
