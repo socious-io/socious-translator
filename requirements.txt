@@ -12,5 +12,4 @@ openai-whisper>=20231117
 python-dotenv>=1.0
 
 numpy>=1.26
-webrtcvad-wheels>=2.0.14
 tqdm>=4.66
