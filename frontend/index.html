@@ -128,114 +128,207 @@
     }
 
 
-    async function startRecording() {
-      // Helper: robustly load the worklet (URL → Blob fallback) with clear errors
-      async function loadWorklet(ctx, url) {
-        try {
-          await ctx.audioWorklet.addModule(`${url}?v=${Date.now()}`);
-          console.log("AudioWorklet loaded via URL");
-          return;
-        } catch (e) {
-          console.warn("addModule(url) failed:", e);
-        }
-        const r = await fetch(`${url}?v=${Date.now()}`, { cache: "no-store" });
-        if (!r.ok) throw new Error(`Worklet HTTP ${r.status} ${r.statusText}`);
-        const code = await r.text();
-        const head = code.slice(0, 256);
-        if (/<!doctype html/i.test(head) || /<html[\s>]/i.test(head)) {
-          throw new Error("Worklet fetch returned HTML (404/redirect/CSP).");
-        }
-        const blob = new Blob([code], { type: "application/javascript" });
-        const blobURL = URL.createObjectURL(blob);
-        try {
-          await ctx.audioWorklet.addModule(blobURL);
-          console.log("AudioWorklet loaded via Blob URL");
-        } finally {
-          URL.revokeObjectURL(blobURL);
-        }
-      }
-
-      try {
-        setStatus("Requesting mic…");
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            sampleRate: 48000,            // nudges stable input rate
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
+      async function startRecording() {
+        // --- helpers ---
+        async function loadWorklet(ctx, url) {
+          // try normal path
+          try {
+            await ctx.audioWorklet.addModule(`${url}?v=${Date.now()}`);
+            console.log("AudioWorklet loaded via URL");
+            return;
+          } catch (e) {
+            console.warn("addModule(url) failed:", e);
           }
-        });
+          // fetch + sanity check
+          const r = await fetch(`${url}?v=${Date.now()}`, { cache: "no-store" });
+          if (!r.ok) throw new Error(`Worklet HTTP ${r.status} ${r.statusText}`);
+          const code = await r.text();
+          const head = code.slice(0, 256);
+          if (/<!doctype html/i.test(head) || /<html[\s>]/i.test(head)) {
+            throw new Error("Worklet fetch returned HTML (404/redirect/CSP).");
+          }
+          // blob fallback (bypasses MIME/CSP quirks)
+          const blob = new Blob([code], { type: "application/javascript" });
+          const blobURL = URL.createObjectURL(blob);
+          try {
+            await ctx.audioWorklet.addModule(blobURL);
+            console.log("AudioWorklet loaded via Blob URL");
+          } finally {
+            URL.revokeObjectURL(blobURL);
+          }
+        }
 
-        ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-        if (ctx.state === "suspended") await ctx.resume();
-        ctx.onstatechange = () => {
-          console.log("AudioContext:", ctx.state);
-          if (ctx.state === "suspended") ctx.resume().catch(()=>{});
-        };
+        function setupWebSocket() {
+          ws = new WebSocket(wsUrl());
+          ws.binaryType = "arraybuffer";
+          ws.onopen = () => {
+            try { ws.send(JSON.stringify({ direction: directionSelect.value })); } catch {}
+            setButtons(true);
+            setStatus("Streaming…");
+            timer = setInterval(() => {
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "ping" }));
+              }
+            }, 15000);
+          };
+          ws.onmessage = (e) => handleMessage(e.data);
+          ws.onclose   = () => { setStatus("Disconnected"); setButtons(false); clearActive(); };
+          ws.onerror   = (e) => { console.error("WebSocket error:", e); setStatus("WebSocket error"); };
+        }
 
-        // Load the worklet robustly (uses /static route you already serve)
-        await loadWorklet(ctx, "/static/pcm-capture.worklet.js");
+        function teardownAudio() {
+          try { node && node.disconnect(); } catch {}
+          try { stream?.getTracks().forEach(t => t.stop()); } catch {}
+          try { ctx && ctx.close(); } catch {}
+        }
 
-        const source = ctx.createMediaStreamSource(stream);
-        node = new AudioWorkletNode(ctx, "pcm-capture", {
-          processorOptions: { downsampleTo: 16000, frameMs: 20 },
-          numberOfInputs: 1,
-          numberOfOutputs: 1,
-          outputChannelCount: [1]
-        });
+        async function startWithWorklet() {
+          setStatus("Requesting mic…");
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              sampleRate: 48000,
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
 
-        // Keep the graph “audible” so engines keep pulling (no audible echo)
-        const keep = ctx.createGain();
-        keep.gain.value = 0.0;
-        source.connect(keep).connect(ctx.destination);
+          ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+          if (ctx.state === "suspended") await ctx.resume();
+          ctx.onstatechange = () => {
+            console.log("AudioContext:", ctx.state);
+            if (ctx.state === "suspended") ctx.resume().catch(()=>{});
+          };
 
-        // Normal path into the worklet; also connect node → destination
-        source.connect(node);
-        node.connect(ctx.destination);
+          await loadWorklet(ctx, "/static/pcm-capture.worklet.js");
 
-        // WebSocket setup
-        ws = new WebSocket(wsUrl());
-        ws.binaryType = "arraybuffer";
-        ws.onopen = () => {
-          try { ws.send(JSON.stringify({ direction: directionSelect.value })); } catch {}
-          setButtons(true);
-          setStatus("Streaming…");
-          timer = setInterval(() => {
+          const source = ctx.createMediaStreamSource(stream);
+          node = new AudioWorkletNode(ctx, "pcm-capture", {
+            processorOptions: { downsampleTo: 16000, frameMs: 20 },
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [1]
+          });
+
+          // Keep the graph “audible” so engines keep pulling (no audible echo)
+          const keep = ctx.createGain();
+          keep.gain.value = 0.0;
+          source.connect(keep).connect(ctx.destination);
+
+          // Normal path into the worklet; also connect node → destination
+          source.connect(node);
+          node.connect(ctx.destination);
+
+          setupWebSocket();
+
+          // Forward frames → WS with backpressure guard + heartbeat
+          let posted = 0, lastLog = performance.now();
+          node.port.onmessage = (e) => {
             if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: "ping" }));
+              if (ws.bufferedAmount < 512 * 1024) {
+                ws.send(e.data); // ArrayBuffer
+              } // else drop to avoid deadlock
             }
-          }, 15000);
-        };
-        ws.onmessage = (e) => handleMessage(e.data);
-        ws.onclose = () => { setStatus("Disconnected"); setButtons(false); clearActive(); };
-        ws.onerror = (e) => { console.error("WebSocket error:", e); setStatus("WebSocket error"); };
-
-        // Forward frames from the worklet → WS, with backpressure guard and logging
-        let posted = 0, lastLog = performance.now();
-        node.port.onmessage = (e) => {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            if (ws.bufferedAmount < 512 * 1024) {
-              ws.send(e.data);            // e.data is an ArrayBuffer
-            } else {
-              // Drop frame if socket is backpressured to avoid deadlock
+            posted++;
+            const now = performance.now();
+            if (now - lastLog > 1000) {
+              console.log(`worklet → WS frames: ${posted}/s, buffered=${ws ? ws.bufferedAmount : 0}`);
+              posted = 0; lastLog = now;
             }
-          }
-          posted++;
-          const now = performance.now();
-          if (now - lastLog > 1000) {
-            console.log(`worklet → WS frames: ${posted}/s, buffered=${ws ? ws.bufferedAmount : 0}`);
-            posted = 0; lastLog = now;
-          }
-        };
-        node.onprocessorerror = (e) => console.error("AudioWorklet error:", e);
+          };
+          node.onprocessorerror = (e) => console.error("AudioWorklet error:", e);
 
-      } catch (err) {
-        console.error(err);
-        setStatus(err && err.message ? err.message : "Mic/Worklet error");
-        stopRecording();
+          // Watchdog: if the worklet produced 0 frames after 1.5s, fall back
+          setTimeout(() => {
+            if (posted === 0) {
+              console.warn("Worklet produced 0 frames; falling back to ScriptProcessorNode.");
+              teardownAudio();
+              startWithScriptProcessor().catch(err => {
+                console.error("ScriptProcessor fallback failed:", err);
+                setStatus("Audio init failed");
+                stopRecording();
+              });
+            }
+          }, 1500);
+        }
+
+        async function startWithScriptProcessor() {
+          // Reuse the existing mic stream if available; otherwise request again
+          if (!stream) {
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                sampleRate: 48000,
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+              }
+            });
+          }
+          if (!ctx || ctx.state === "closed") {
+            ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+            if (ctx.state === "suspended") await ctx.resume();
+          }
+          const source = ctx.createMediaStreamSource(stream);
+          const proc = ctx.createScriptProcessor(2048, 1, 1);
+          node = proc; // so stopRecording() can clean up generically
+          source.connect(proc);
+          proc.connect(ctx.destination);
+
+          setupWebSocket();
+
+          const outRate = 16000;
+          let carry = new Float32Array(0);
+          let posted = 0, lastLog = performance.now();
+
+          proc.onaudioprocess = ({ inputBuffer }) => {
+            const f32 = inputBuffer.getChannelData(0);
+            const buf = new Float32Array(carry.length + f32.length);
+            buf.set(carry, 0);
+            buf.set(f32, carry.length);
+
+            const ratio = inputBuffer.sampleRate / outRate;
+            const outLen = Math.floor(buf.length / ratio);
+            const down = new Float32Array(outLen);
+            for (let i = 0; i < outLen; i++) down[i] = buf[Math.floor(i * ratio)];
+
+            const i16 = new Int16Array(down.length);
+            for (let i = 0; i < down.length; i++) {
+              let s = down[i];
+              if (s > 1) s = 1; else if (s < -1) s = -1;
+              i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              if (ws.bufferedAmount < 512 * 1024) ws.send(i16.buffer);
+            }
+
+            const consumed = Math.floor(outLen * ratio);
+            carry = buf.subarray(consumed);
+
+            posted++;
+            const now = performance.now();
+            if (now - lastLog > 1000) {
+              console.log(`SPN → WS frames: ${posted}/s, buffered=${ws ? ws.bufferedAmount : 0}`);
+              posted = 0; lastLog = now;
+            }
+          };
+        }
+
+        try {
+          await startWithWorklet();
+        } catch (err) {
+          console.error("Worklet path failed:", err);
+          try {
+            await startWithScriptProcessor();
+          } catch (e2) {
+            console.error("ScriptProcessor fallback failed:", e2);
+            setStatus(e2 && e2.message ? e2.message : "Mic/Worklet error");
+            stopRecording();
+          }
+        }
       }
-    }
 
 
     function stopRecording() {
