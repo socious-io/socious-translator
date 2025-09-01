@@ -309,8 +309,6 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    vad = webrtcvad.Vad(2)
-
     ring = bytearray()
     last_partial = ""
     hang_ms = 0
