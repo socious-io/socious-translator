@@ -15,6 +15,11 @@ import numpy as np
 from collections import deque
 import config
 
+# Load performance preset - uncomment one of these:
+# config.load_preset("speed")      # Fastest, lower quality
+# config.load_preset("balanced")   # Default - good balance
+# config.load_preset("quality")    # Slower, highest quality
+
 # basic setup and client
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
@@ -49,8 +54,21 @@ else:
 # Warm up the model
 try:
     segments, _ = model.transcribe("/tmp/warm.wav", language="en")
-except:
+    print("Model warmed up successfully")
+except Exception as e:
+    print(f"Model warmup failed: {e}")
     pass
+
+# Print configuration summary
+print(f"=== Translation System Configuration ===")
+print(f"Whisper Model: {config.WHISPER_MODEL_SIZE}")
+print(f"Translation Model: {config.TRANSLATION_MODEL}")
+print(f"Compute Type: {config.WHISPER_COMPUTE_TYPE}")
+print(f"VAD Available: {HAS_WEBRTCVAD}")
+print(f"Caching Enabled: {config.ENABLE_CACHING}")
+print(f"Min Chunk Duration: {config.MIN_CHUNK_DURATION}s")
+print(f"Max Queue Size: {config.MAX_QUEUE_SIZE}")
+print("=" * 40)
 
 app = FastAPI()
 app.add_middleware(
@@ -62,17 +80,11 @@ app.add_middleware(
 # tiny context buffers for current-line translation only
 recent_src_segments: list[str] = []
 recent_targets: list[str] = []
-MAX_SRC_CTX = 2
-MAX_RECENT = 10
 
-# Audio processing configuration
-MIN_CHUNK_DURATION = 0.5  # seconds
-OVERLAP_DURATION = 1.0     # seconds
-SAMPLE_RATE = 16000
+# All configuration now handled by config.py module
 
 # Translation cache
 translation_cache = {}
-CACHE_MAX_SIZE = 1000
 
 # VAD configuration (optional)
 vad = None
@@ -233,8 +245,11 @@ def has_speech(audio_data: bytes, sample_rate: int = 16000) -> bool:
             # Simple energy-based voice activity detection
             energy = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
             # Threshold for speech (adjust as needed)
-            return energy > 1000
-        except Exception:
+            has_activity = energy > 1000
+            # Uncomment for debugging: print(f"Energy VAD: {energy:.1f}, has_speech: {has_activity}")
+            return has_activity
+        except Exception as e:
+            print(f"VAD fallback error: {e}")
             return True
     
     try:
@@ -298,6 +313,7 @@ async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     if config.ENABLE_CACHING:
         cached = get_cached_translation(text, source_lang, target_lang)
         if cached:
+            # Uncomment for debugging: print(f"Cache hit for: {text[:50]}...")
             return cached
     
     source_context = " ".join(recent_src_segments[-config.MAX_SRC_CTX:])
@@ -424,21 +440,21 @@ async def process_audio_chunk(audio_data: bytes, source_lang: str, target_lang: 
             wav_file.flush()
             
             try:
-                # Transcribe with faster-whisper
-                segments, info = model.transcribe(
-                    wav_file.name,
-                    temperature=0.0,
-                    beam_size=config.BEAM_SIZE,
-                    condition_on_previous_text=False,
-                    hallucination_silence_threshold=0.30,
-                    no_speech_threshold=0.6,
-                    language="en" if source_lang == "English" else "ja",
-                    compression_ratio_threshold=1.7,
-                    logprob_threshold=-0.3,
-                    task=whisper_task,
-                    vad_filter=config.ENABLE_VAD_FILTER,
-                    vad_parameters=dict(min_silence_duration_ms=config.MIN_SILENCE_DURATION_MS)
-                )
+                # Transcribe with faster-whisper (using only supported parameters)
+                transcribe_kwargs = {
+                    "language": "en" if source_lang == "English" else "ja",
+                    "task": whisper_task,
+                    "beam_size": config.BEAM_SIZE,
+                    "temperature": 0.0,
+                    "condition_on_previous_text": False,
+                }
+                
+                # Only add VAD parameters if enabled
+                if config.ENABLE_VAD_FILTER:
+                    transcribe_kwargs["vad_filter"] = True
+                    transcribe_kwargs["vad_parameters"] = dict(min_silence_duration_ms=config.MIN_SILENCE_DURATION_MS)
+                
+                segments, info = model.transcribe(wav_file.name, **transcribe_kwargs)
                 
                 # Extract text from segments
                 src_text = " ".join([segment.text for segment in segments]).strip()
@@ -549,23 +565,33 @@ async def websocket_endpoint(websocket: WebSocket):
 
         try:
             while True:
-                msg = await websocket.receive()
-                if "bytes" not in msg:
-                    continue
-
-                audio = msg["bytes"]
-                if not audio:
-                    continue
-
-                # Add to processing queue (non-blocking)
                 try:
-                    processing_queue.put_nowait((audio, source_lang, target_lang, whisper_task, direction))
-                except asyncio.QueueFull:
-                    print("Processing queue full, dropping audio chunk")
+                    msg = await websocket.receive()
+                    if "bytes" not in msg:
+                        continue
+
+                    audio = msg["bytes"]
+                    if not audio:
+                        continue
+
+                    # Add to processing queue (non-blocking)
+                    try:
+                        processing_queue.put_nowait((audio, source_lang, target_lang, whisper_task, direction))
+                    except asyncio.QueueFull:
+                        print("Processing queue full, dropping audio chunk")
+                        
+                except Exception as e:
+                    print(f"WebSocket receive error: {e}")
+                    break
                     
         finally:
+            # Properly cancel and wait for tasks
             processor_task.cancel()
             sender_task.cancel()
+            try:
+                await asyncio.gather(processor_task, sender_task, return_exceptions=True)
+            except Exception as e:
+                print(f"Task cleanup error: {e}")
             
     except Exception as e:
         print("WebSocket error:", e)
