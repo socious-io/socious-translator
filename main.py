@@ -16,9 +16,10 @@ from collections import deque
 import config
 
 # Load performance preset - uncomment one of these:
-# config.load_preset("speed")      # Fastest, lower quality
-# config.load_preset("balanced")   # Default - good balance
+config.load_preset("speed")      # Fastest, lower quality - ENABLED FOR TESTING
+# config.load_preset("balanced")   # Default - good balance  
 # config.load_preset("quality")    # Slower, highest quality
+# config.load_preset("original")   # Match your original setup
 
 # basic setup and client
 load_dotenv()
@@ -330,87 +331,11 @@ async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
     if config.ENABLE_CACHING:
         cached = get_cached_translation(text, source_lang, target_lang)
         if cached:
-            # Uncomment for debugging: print(f"Cache hit for: {text[:50]}...")
             return cached
     
-    source_context = " ".join(recent_src_segments[-config.MAX_SRC_CTX:])
-    recent_target_str = "\n".join(recent_targets[-config.MAX_RECENT:])
-
-    system = "Translate live ASR segments into natural, idiomatic target-language captions. Return ONLY the translation text."
-    user = f"""
-You are translating a single ASR segment from English → Japanese.
-
-<goal>
-Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preserve original word strength, tone, and register. Use context only to resolve ambiguous pronouns or cut-offs.
-</goal>
-
-<context_use>
-- Use <source_context> only for ambiguity in pronouns/ellipses/cut-offs.
-- Do not merge or restate earlier material beyond what’s needed for this segment.
-- If input repeats a clause from <source_context>, keep it once in the cleanest form.
-- Do not re-translate content already fully covered in <recent_target> unless new info is added.
-</context_use>
-
-<priorities>
-1) Fidelity first — preserve meaning and *emotional strength*.
-2) No intensity shifts (e.g., “annoyed” ≠ 「激怒」; “kind of good” ≠ 「最高」).
-3) Don’t invent filler, asides, or emphasis not in the source.
-4) Match register/politeness exactly (casual/neutral/formal).
-5) Overlap handling — remove duplicated words; don’t paraphrase earlier material unless literally repeated here.
-6) Numbers/units/symbols/proper names — keep digits/symbols; use established JP renderings or one consistent form.
-7) Describe nonverbal events only if explicitly audible/mentioned.
-8) If input is already {target_lang}, return unchanged.
-9) Labels/titles/meta — translate as labels/titles; don’t expand to full sentences.
-10) Preserve grammatical person/mood; don’t add/soften/strengthen imperatives or politeness.
-11) Drop standalone low-content interjections (“uh/erm”); keep one token max if needed (e.g., 「えっと」).
-12) Consistency — keep proper-noun spellings consistent across the session.
-13) Redundancy — if fully covered in <recent_target> with no new detail, output nothing.
-</priorities>
-
-<style_targets>
-- 明確・簡潔。
-- 自然だが、意味・トーン・強度は一切変更しない。
-- 脚色・強調・コメントは加えない。
-</style_targets>
-
-<source_context>
-{source_context}
-</source_context>
-
-<recent_target>
-{recent_target_str}
-</recent_target>
-
-<examples_positive>
-<input>Please double-check the numbers.</input>
-<output>数値を再確認してください。</output>
-
-<input>It’s kind of slow—nothing on screen yet.</input>
-<output>少し遅いですね。まだ画面に何も表示されていません。</output>
-
-<input>We may roll it back if needed.</input>
-<output>必要であればロールバックする可能性があります。</output>
-</examples_positive>
-
-<examples_boundary>
-<input>Could you fix it?</input>
-<bad_output>すぐに直してください！</bad_output>
-<why>Intensity was upgraded.</why>
-<good_output>修正してもらえますか。</good_output>
-
-<input>Do it.</input>
-<bad_output>やっていただけますか。</bad_output>
-<why>Imperative was softened.</why>
-<good_output>やれ。</good_output>
-</examples_boundary>
-
-<target_lang>日本語</target_lang>
-
-<input>
-{text}
-</input>
-
-""".strip()
+    # Simplified, much shorter prompt for speed
+    system = "Translate to natural Japanese. Return ONLY the translation."
+    user = f"Translate: {text}"
 
     try:
         resp = await client.chat.completions.create(
@@ -419,97 +344,86 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_completion_tokens=128
+            max_completion_tokens=64,  # Reduced for speed
+            temperature=0.0  # Deterministic for consistency
         )
         translation = (resp.choices[0].message.content or "").strip()
+        
         # Cache the result if caching is enabled
         if config.ENABLE_CACHING:
             cache_translation(text, source_lang, target_lang, translation)
+        
         return translation
     except Exception as e:
-        print("Translation error:", e)
-        return ""
+        print(f"Translation error: {e}")
+        return text  # Return original on error
 
 @app.get("/")
 async def serve_index():
     return FileResponse(os.path.join("frontend", "index.html"))
 
-async def process_audio_chunk(audio_data: bytes, source_lang: str, target_lang: str, whisper_task: str, direction: str) -> tuple[str, str]:
-    """Process a single audio chunk asynchronously."""
+async def process_audio_chunk_fast(audio_data: bytes, source_lang: str, target_lang: str, whisper_task: str, direction: str) -> tuple[str, str]:
+    """Process audio chunk with minimal overhead for speed."""
     try:
-        # Convert audio to WAV in memory
-        wav_data = convert_audio_in_memory(audio_data)
-        if not wav_data:
-            return "", ""
-
-        # Check minimum duration
-        duration = get_audio_duration(wav_data)
-        if duration < config.MIN_CHUNK_DURATION:
-            return "", ""
-
-        # Check for speech activity
-        if not has_speech(wav_data):
-            return "", ""
-
-        # Save to temporary file for Whisper (faster-whisper needs file path)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_file:
-            wav_file.write(wav_data)
-            wav_file.flush()
+        # Direct file write without extra checks for speed
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as raw_file:
+            raw_file.write(audio_data)
+            raw_file.flush()
             
-            try:
-                # Transcribe with faster-whisper (using only supported parameters)
-                transcribe_kwargs = {
-                    "language": "en" if source_lang == "English" else "ja",
-                    "task": whisper_task,
-                    "beam_size": config.BEAM_SIZE,
-                    "temperature": 0.0,
-                    "condition_on_previous_text": False,
-                }
-                
-                # Only add VAD parameters if enabled
-                if config.ENABLE_VAD_FILTER:
-                    transcribe_kwargs["vad_filter"] = True
-                    transcribe_kwargs["vad_parameters"] = dict(min_silence_duration_ms=config.MIN_SILENCE_DURATION_MS)
-                
-                segments, info = model.transcribe(wav_file.name, **transcribe_kwargs)
-                
-                # Extract text from segments
-                src_text = " ".join([segment.text for segment in segments]).strip()
-                
-                if not src_text:
-                    return "", ""
-                
-                print("ASR:", src_text)
-                
-                # Skip unwanted content
-                if is_interjection_thanks(src_text) or is_cta_like(src_text):
-                    return "", ""
-                
-                # Translate if needed
-                if direction == "en-ja":
-                    translated = await translate_text(src_text, source_lang, target_lang)
-                else:
-                    translated = src_text  # Whisper already gave English
-                
-                # Skip unwanted translations
-                if is_interjection_thanks(translated) or is_cta_like(translated):
-                    return "", ""
-                
-                translated = translated.strip()
-                if not translated or not re.search(r'[A-Za-z0-9ぁ-んァ-ン一-龯々ー]', translated):
-                    return "", ""
-                
-                return src_text, translated
-                
-            finally:
-                # Clean up temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_file:
+                # Fast conversion
                 try:
-                    os.unlink(wav_file.name)
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", raw_file.name, "-ar", str(config.SAMPLE_RATE), "-ac", "1", wav_file.name],
+                        stdout=subprocess.DEVNULL, 
+                        stderr=subprocess.DEVNULL, 
+                        check=True,
+                        timeout=5  # 5 second timeout
+                    )
                 except:
-                    pass
+                    return "", ""
+                
+                # Fast transcription with minimal parameters
+                try:
+                    segments, _ = model.transcribe(
+                        wav_file.name,
+                        language="en" if source_lang == "English" else "ja",
+                        task=whisper_task,
+                        beam_size=1,  # Fastest setting
+                        temperature=0.0,
+                        condition_on_previous_text=False,
+                    )
                     
+                    # Extract text quickly
+                    src_text = " ".join([segment.text for segment in segments]).strip()
+                    
+                    if not src_text:
+                        return "", ""
+                    
+                    print(f"ASR ({direction}): {src_text}")
+                    
+                    # Skip basic filtering
+                    if len(src_text) < 3:  # Too short
+                        return "", ""
+                    
+                    # Fast translation
+                    if direction == "en-ja":
+                        translated = await translate_text(src_text, source_lang, target_lang)
+                    else:
+                        translated = src_text
+                    
+                    return src_text, translated
+                    
+                finally:
+                    # Cleanup
+                    try:
+                        os.unlink(raw_file.name)
+                        os.unlink(wav_file.name)
+                    except:
+                        pass
+                        
     except Exception as e:
-        print(f"Audio processing error: {e}")
+        print(f"Fast processing error: {e}")
         return "", ""
 
 
@@ -517,49 +431,6 @@ async def process_audio_chunk(audio_data: bytes, source_lang: str, target_lang: 
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
-
-    # Processing queue for async pipeline
-    processing_queue = asyncio.Queue(maxsize=config.MAX_QUEUE_SIZE)
-    results_queue = asyncio.Queue()
-    
-    async def audio_processor():
-        """Background task to process audio chunks."""
-        while True:
-            try:
-                audio_data, source_lang, target_lang, whisper_task, direction = await processing_queue.get()
-                src_text, translated = await process_audio_chunk(
-                    audio_data, source_lang, target_lang, whisper_task, direction
-                )
-                
-                if src_text and translated:
-                    await results_queue.put((src_text, translated))
-                
-                processing_queue.task_done()
-            except Exception as e:
-                print(f"Audio processor error: {e}")
-
-    async def result_sender():
-        """Background task to send results."""
-        while True:
-            try:
-                src_text, translated = await results_queue.get()
-                
-                # Update context buffers
-                recent_src_segments.append(src_text)
-                if len(recent_src_segments) > config.MAX_SRC_CTX * 3:
-                    recent_src_segments.pop(0)
-
-                recent_targets.append(translated)
-                if len(recent_targets) > config.MAX_RECENT:
-                    recent_targets.pop(0)
-
-                segment_id = str(uuid.uuid4())
-                await websocket.send_text(f"[DONE]{json.dumps({'id': segment_id, 'text': translated})}")
-                
-                results_queue.task_done()
-            except Exception as e:
-                print(f"Result sender error: {e}")
-                break
 
     try:
         settings = await websocket.receive_text()
@@ -576,42 +447,44 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
 
-        # Start background tasks
-        processor_task = asyncio.create_task(audio_processor())
-        sender_task = asyncio.create_task(result_sender())
+        print(f"Processing {direction} translation")
 
-        try:
-            while True:
-                try:
-                    msg = await websocket.receive()
-                    if "bytes" not in msg:
-                        continue
-
-                    audio = msg["bytes"]
-                    if not audio:
-                        continue
-
-                    # Add to processing queue (non-blocking)
-                    try:
-                        processing_queue.put_nowait((audio, source_lang, target_lang, whisper_task, direction))
-                    except asyncio.QueueFull:
-                        print("Processing queue full, dropping audio chunk")
-                        
-                except Exception as e:
-                    print(f"WebSocket receive error: {e}")
-                    break
-                    
-        finally:
-            # Properly cancel and wait for tasks
-            processor_task.cancel()
-            sender_task.cancel()
+        # Simple direct processing for speed
+        while True:
             try:
-                await asyncio.gather(processor_task, sender_task, return_exceptions=True)
+                msg = await websocket.receive()
+                if "bytes" not in msg:
+                    continue
+
+                audio = msg["bytes"]
+                if not audio or len(audio) < 1000:  # Skip very small chunks
+                    continue
+
+                # Process directly without queue overhead
+                src_text, translated = await process_audio_chunk_fast(
+                    audio, source_lang, target_lang, whisper_task, direction
+                )
+                
+                if src_text and translated:
+                    # Update context quickly
+                    recent_src_segments.append(src_text)
+                    if len(recent_src_segments) > config.MAX_SRC_CTX * 3:
+                        recent_src_segments.pop(0)
+
+                    recent_targets.append(translated)
+                    if len(recent_targets) > config.MAX_RECENT:
+                        recent_targets.pop(0)
+
+                    # Send immediately
+                    segment_id = str(uuid.uuid4())
+                    await websocket.send_text(f"[DONE]{json.dumps({'id': segment_id, 'text': translated})}")
+                        
             except Exception as e:
-                print(f"Task cleanup error: {e}")
+                print(f"Processing error: {e}")
+                continue  # Keep going on individual errors
             
     except Exception as e:
-        print("WebSocket error:", e)
+        print(f"WebSocket error: {e}")
         await websocket.close()
 
 if __name__ == "__main__":
