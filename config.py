@@ -6,7 +6,7 @@ Adjust these parameters to optimize for your specific use case.
 # Model Configuration
 WHISPER_MODEL_SIZE = "medium"  # Options: "tiny", "base", "small", "medium", "large", "large-v2", "large-v3"
 WHISPER_COMPUTE_TYPE = "int8"  # Options: "int8", "float16", "float32" (int8 is fastest)
-WHISPER_DEVICE = "cpu"  # Options: "cpu", "cuda" (will auto-detect GPU if available)
+WHISPER_DEVICE = "cpu"  # Options: "cpu", "auto" (auto tries GPU first, falls back to CPU)
 
 # OpenAI Translation Model  
 TRANSLATION_MODEL = "gpt-4o-mini"  # Options: "gpt-4o-mini", "gpt-4o", "gpt-4"

@@ -35,21 +35,37 @@ try:
 except:
     pass
 
-# Load whisper model with configuration
-model = WhisperModel(config.WHISPER_MODEL_SIZE, device=config.WHISPER_DEVICE, compute_type=config.WHISPER_COMPUTE_TYPE)
+# Load whisper model with robust GPU detection
+model = None
+device_used = "cpu"
+compute_type_used = config.WHISPER_COMPUTE_TYPE
 
-# Try to use GPU if available and configured
-if config.WHISPER_DEVICE == "cpu":
+# Try GPU first if set to "auto" or "cuda"
+if config.WHISPER_DEVICE in ["auto", "cuda"]:
     try:
+        print("Attempting to load GPU model...")
         gpu_model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
-        # Test GPU model
+        # Quick test to ensure GPU actually works
         test_segments, _ = gpu_model.transcribe("/tmp/warm.wav", language="en")
         model = gpu_model
-        print("Using GPU acceleration")
-    except:
-        print("Using CPU - GPU not available")
-else:
-    print(f"Using {config.WHISPER_DEVICE} with {config.WHISPER_COMPUTE_TYPE}")
+        device_used = "cuda"
+        compute_type_used = "float16"
+        print("✅ Using GPU acceleration (CUDA)")
+    except Exception as e:
+        print(f"❌ GPU failed: {e}")
+        print("Falling back to CPU...")
+        model = None
+
+# Fallback to CPU if GPU failed or not requested
+if model is None:
+    try:
+        model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+        device_used = "cpu"
+        compute_type_used = "int8"
+        print("✅ Using CPU with int8 quantization")
+    except Exception as e:
+        print(f"❌ Critical error loading model: {e}")
+        raise
 
 # Warm up the model
 try:
@@ -62,8 +78,9 @@ except Exception as e:
 # Print configuration summary
 print(f"=== Translation System Configuration ===")
 print(f"Whisper Model: {config.WHISPER_MODEL_SIZE}")
+print(f"Device: {device_used}")
+print(f"Compute Type: {compute_type_used}")
 print(f"Translation Model: {config.TRANSLATION_MODEL}")
-print(f"Compute Type: {config.WHISPER_COMPUTE_TYPE}")
 print(f"VAD Available: {HAS_WEBRTCVAD}")
 print(f"Caching Enabled: {config.ENABLE_CACHING}")
 print(f"Min Chunk Duration: {config.MIN_CHUNK_DURATION}s")

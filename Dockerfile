@@ -27,9 +27,15 @@ RUN python - <<'PY'
 from faster_whisper import WhisperModel
 import os
 print("Cache dir:", os.getenv("XDG_CACHE_HOME"))
-# Preload medium model (balanced speed/quality)
-model = WhisperModel("medium", device="cpu", compute_type="int8")
-print("Preloaded faster-whisper medium model.")
+# Preload medium model (CPU-only for container compatibility)
+try:
+    model = WhisperModel("medium", device="cpu", compute_type="int8")
+    print("✅ Preloaded faster-whisper medium model (CPU)")
+except Exception as e:
+    print(f"❌ Model preload failed: {e}")
+    # Try smaller model as fallback
+    model = WhisperModel("base", device="cpu", compute_type="int8") 
+    print("✅ Preloaded faster-whisper base model (CPU fallback)")
 PY
 
 # Verify (optional)
