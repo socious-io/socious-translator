@@ -1,8 +1,13 @@
-import tempfile, subprocess, uvicorn, openai, whisper, os, json, uuid, re
+import tempfile, subprocess, uvicorn, openai, os, json, uuid, re, asyncio, hashlib, time, io
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
+from faster_whisper import WhisperModel
+import webrtcvad
+import numpy as np
+from collections import deque
+import config
 
 # basic setup and client
 load_dotenv()
@@ -19,10 +24,25 @@ try:
 except:
     pass
 
-# load whisper once
-model = whisper.load_model("large-v3")
+# Load whisper model with configuration
+model = WhisperModel(config.WHISPER_MODEL_SIZE, device=config.WHISPER_DEVICE, compute_type=config.WHISPER_COMPUTE_TYPE)
+
+# Try to use GPU if available and configured
+if config.WHISPER_DEVICE == "cpu":
+    try:
+        gpu_model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
+        # Test GPU model
+        test_segments, _ = gpu_model.transcribe("/tmp/warm.wav", language="en")
+        model = gpu_model
+        print("Using GPU acceleration")
+    except:
+        print("Using CPU - GPU not available")
+else:
+    print(f"Using {config.WHISPER_DEVICE} with {config.WHISPER_COMPUTE_TYPE}")
+
+# Warm up the model
 try:
-    model.transcribe("/tmp/warm.wav", language="en", fp16=True)
+    segments, _ = model.transcribe("/tmp/warm.wav", language="en")
 except:
     pass
 
@@ -38,6 +58,21 @@ recent_src_segments: list[str] = []
 recent_targets: list[str] = []
 MAX_SRC_CTX = 2
 MAX_RECENT = 10
+
+# Audio processing configuration
+MIN_CHUNK_DURATION = 0.5  # seconds
+OVERLAP_DURATION = 1.0     # seconds
+SAMPLE_RATE = 16000
+
+# Translation cache
+translation_cache = {}
+CACHE_MAX_SIZE = 1000
+
+# VAD configuration
+vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
+
+# Audio buffer for overlapping chunks
+audio_buffer = deque(maxlen=int(config.SAMPLE_RATE * 5))  # 5 second buffer
 
 # exact short interjections only (and standalone "you")
 THANKS_RE = re.compile(
@@ -157,9 +192,97 @@ def is_cta_like(text: str) -> bool:
     return any(rx.search(text) for rx in _CTA_REGEXES)
 
 
+def get_cache_key(text: str, source_lang: str, target_lang: str) -> str:
+    """Generate cache key for translation."""
+    content = f"{text}|{source_lang}|{target_lang}"
+    return hashlib.md5(content.encode()).hexdigest()
+
+
+def get_cached_translation(text: str, source_lang: str, target_lang: str) -> str:
+    """Get cached translation if available."""
+    key = get_cache_key(text, source_lang, target_lang)
+    return translation_cache.get(key)
+
+
+def cache_translation(text: str, source_lang: str, target_lang: str, translation: str):
+    """Cache translation with LRU eviction."""
+    key = get_cache_key(text, source_lang, target_lang)
+    
+    if len(translation_cache) >= config.CACHE_MAX_SIZE:
+        # Remove oldest entry
+        oldest_key = next(iter(translation_cache))
+        del translation_cache[oldest_key]
+    
+    translation_cache[key] = translation
+
+
+def has_speech(audio_data: bytes, sample_rate: int = 16000) -> bool:
+    """Check if audio contains speech using WebRTC VAD."""
+    try:
+        # Convert to numpy array
+        audio_array = np.frombuffer(audio_data, dtype=np.int16)
+        
+        # VAD requires specific frame sizes (10ms, 20ms, 30ms)
+        frame_duration = 30  # ms
+        frame_size = int(sample_rate * frame_duration / 1000)
+        
+        # Check if we have enough data
+        if len(audio_array) < frame_size:
+            return False
+        
+        # Process in 30ms frames
+        speech_frames = 0
+        total_frames = 0
+        
+        for i in range(0, len(audio_array) - frame_size, frame_size):
+            frame = audio_array[i:i + frame_size]
+            if vad.is_speech(frame.tobytes(), sample_rate):
+                speech_frames += 1
+            total_frames += 1
+        
+        # Return True if more than 30% of frames contain speech
+        return speech_frames / total_frames > config.VAD_SPEECH_THRESHOLD if total_frames > 0 else False
+    except Exception:
+        # If VAD fails, assume there's speech
+        return True
+
+
+def convert_audio_in_memory(input_data: bytes) -> bytes:
+    """Convert audio to WAV format in memory using FFmpeg."""
+    try:
+        process = subprocess.Popen(
+            ["ffmpeg", "-i", "pipe:0", "-ar", str(config.SAMPLE_RATE), "-ac", "1", "-f", "wav", "pipe:1"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+        
+        wav_data, _ = process.communicate(input=input_data)
+        return wav_data if process.returncode == 0 else b""
+    except Exception:
+        return b""
+
+
+def get_audio_duration(wav_data: bytes) -> float:
+    """Get duration of WAV audio data in seconds."""
+    try:
+        # Skip WAV header (44 bytes) and calculate duration
+        audio_data = wav_data[44:]  # Skip WAV header
+        num_samples = len(audio_data) // 2  # 16-bit samples
+        return num_samples / config.SAMPLE_RATE
+    except Exception:
+        return 0.0
+
+
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
-    source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
-    recent_target_str = "\n".join(recent_targets[-MAX_RECENT:])
+    # Check cache first if enabled
+    if config.ENABLE_CACHING:
+        cached = get_cached_translation(text, source_lang, target_lang)
+        if cached:
+            return cached
+    
+    source_context = " ".join(recent_src_segments[-config.MAX_SRC_CTX:])
+    recent_target_str = "\n".join(recent_targets[-config.MAX_RECENT:])
 
     system = "Translate live ASR segments into natural, idiomatic target-language captions. Return ONLY the translation text."
     user = f"""
@@ -239,15 +362,18 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
 
     try:
         resp = await client.chat.completions.create(
-            model="gpt-5",
+            model=config.TRANSLATION_MODEL,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            reasoning_effort="minimal",
             max_completion_tokens=128
         )
-        return (resp.choices[0].message.content or "").strip()
+        translation = (resp.choices[0].message.content or "").strip()
+        # Cache the result if caching is enabled
+        if config.ENABLE_CACHING:
+            cache_translation(text, source_lang, target_lang, translation)
+        return translation
     except Exception as e:
         print("Translation error:", e)
         return ""
@@ -256,10 +382,132 @@ Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preser
 async def serve_index():
     return FileResponse(os.path.join("frontend", "index.html"))
 
+async def process_audio_chunk(audio_data: bytes, source_lang: str, target_lang: str, whisper_task: str, direction: str) -> tuple[str, str]:
+    """Process a single audio chunk asynchronously."""
+    try:
+        # Convert audio to WAV in memory
+        wav_data = convert_audio_in_memory(audio_data)
+        if not wav_data:
+            return "", ""
+
+        # Check minimum duration
+        duration = get_audio_duration(wav_data)
+        if duration < config.MIN_CHUNK_DURATION:
+            return "", ""
+
+        # Check for speech activity
+        if not has_speech(wav_data):
+            return "", ""
+
+        # Save to temporary file for Whisper (faster-whisper needs file path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_file:
+            wav_file.write(wav_data)
+            wav_file.flush()
+            
+            try:
+                # Transcribe with faster-whisper
+                segments, info = model.transcribe(
+                    wav_file.name,
+                    temperature=0.0,
+                    beam_size=config.BEAM_SIZE,
+                    condition_on_previous_text=False,
+                    hallucination_silence_threshold=0.30,
+                    no_speech_threshold=0.6,
+                    language="en" if source_lang == "English" else "ja",
+                    compression_ratio_threshold=1.7,
+                    logprob_threshold=-0.3,
+                    task=whisper_task,
+                    vad_filter=config.ENABLE_VAD_FILTER,
+                    vad_parameters=dict(min_silence_duration_ms=config.MIN_SILENCE_DURATION_MS)
+                )
+                
+                # Extract text from segments
+                src_text = " ".join([segment.text for segment in segments]).strip()
+                
+                if not src_text:
+                    return "", ""
+                
+                print("ASR:", src_text)
+                
+                # Skip unwanted content
+                if is_interjection_thanks(src_text) or is_cta_like(src_text):
+                    return "", ""
+                
+                # Translate if needed
+                if direction == "en-ja":
+                    translated = await translate_text(src_text, source_lang, target_lang)
+                else:
+                    translated = src_text  # Whisper already gave English
+                
+                # Skip unwanted translations
+                if is_interjection_thanks(translated) or is_cta_like(translated):
+                    return "", ""
+                
+                translated = translated.strip()
+                if not translated or not re.search(r'[A-Za-z0-9ぁ-んァ-ン一-龯々ー]', translated):
+                    return "", ""
+                
+                return src_text, translated
+                
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(wav_file.name)
+                except:
+                    pass
+                    
+    except Exception as e:
+        print(f"Audio processing error: {e}")
+        return "", ""
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connected")
+
+    # Processing queue for async pipeline
+    processing_queue = asyncio.Queue(maxsize=config.MAX_QUEUE_SIZE)
+    results_queue = asyncio.Queue()
+    
+    async def audio_processor():
+        """Background task to process audio chunks."""
+        while True:
+            try:
+                audio_data, source_lang, target_lang, whisper_task, direction = await processing_queue.get()
+                src_text, translated = await process_audio_chunk(
+                    audio_data, source_lang, target_lang, whisper_task, direction
+                )
+                
+                if src_text and translated:
+                    await results_queue.put((src_text, translated))
+                
+                processing_queue.task_done()
+            except Exception as e:
+                print(f"Audio processor error: {e}")
+
+    async def result_sender():
+        """Background task to send results."""
+        while True:
+            try:
+                src_text, translated = await results_queue.get()
+                
+                # Update context buffers
+                recent_src_segments.append(src_text)
+                if len(recent_src_segments) > config.MAX_SRC_CTX * 3:
+                    recent_src_segments.pop(0)
+
+                recent_targets.append(translated)
+                if len(recent_targets) > config.MAX_RECENT:
+                    recent_targets.pop(0)
+
+                segment_id = str(uuid.uuid4())
+                await websocket.send_text(f"[DONE]{json.dumps({'id': segment_id, 'text': translated})}")
+                
+                results_queue.task_done()
+            except Exception as e:
+                print(f"Result sender error: {e}")
+                break
 
     try:
         settings = await websocket.receive_text()
@@ -276,83 +524,30 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
 
-        while True:
-            msg = await websocket.receive()
-            if "bytes" not in msg:
-                continue
+        # Start background tasks
+        processor_task = asyncio.create_task(audio_processor())
+        sender_task = asyncio.create_task(result_sender())
 
-            audio = msg["bytes"]
-            if not audio:
-                continue
+        try:
+            while True:
+                msg = await websocket.receive()
+                if "bytes" not in msg:
+                    continue
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as raw:
-                raw.write(audio)
-                raw.flush()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav:
-                    try:
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-i", raw.name, "-ar", "16000", "-ac", "1", wav.name],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True
-                        )
-                    except:
-                        continue
+                audio = msg["bytes"]
+                if not audio:
+                    continue
 
-                    result = model.transcribe(
-                        wav.name,
-                        fp16=True,
-                        temperature=0.0,
-                        beam_size=5,
-                        condition_on_previous_text=False,
-                        hallucination_silence_threshold=0.30,
-                        no_speech_threshold=0.6,
-                        language="en" if source_lang == "English" else "ja",
-                        compression_ratio_threshold=1.7,
-                        logprob_threshold=-0.3,
-                        task=whisper_task,
-                    )
-
-                    src_text = (result.get("text") or "").strip()
-                    if not src_text:
-                        continue
-                    print("ASR:", src_text)
-
-                    if is_interjection_thanks(src_text):
-                        print("Skipped short thank-you interjection (source).")
-                        continue
-                    if is_cta_like(src_text):
-                        print("Dropped CTA/meta filler (source).")
-                        continue
-
-                    segment_id = str(uuid.uuid4())
-
-                    if direction == "en-ja":
-                        translated = await translate_text(src_text, source_lang, target_lang)
-                    else:
-                        translated = src_text  # Whisper already gave English
-
-                    if is_interjection_thanks(translated):
-                        print("Skipped short thank-you interjection (target).")
-                        continue
-                    if is_cta_like(translated):
-                        print("Dropped CTA/meta filler (target).")
-                        continue
-
-                    translated = translated.strip()
-                    if not translated or not re.search(r'[A-Za-z0-9ぁ-んァ-ン一-龯々ー]', translated):
-                        print("Suppressed empty/no-op output.")
-                        continue
-
-                    # update tiny context buffers only when emitting
-                    recent_src_segments.append(src_text)
-                    if len(recent_src_segments) > MAX_SRC_CTX * 3:
-                        recent_src_segments.pop(0)
-
-                    recent_targets.append(translated)
-                    if len(recent_targets) > MAX_RECENT:
-                        recent_targets.pop(0)
-
-                    await websocket.send_text(f"[DONE]{json.dumps({'id': segment_id, 'text': translated})}")
-
+                # Add to processing queue (non-blocking)
+                try:
+                    processing_queue.put_nowait((audio, source_lang, target_lang, whisper_task, direction))
+                except asyncio.QueueFull:
+                    print("Processing queue full, dropping audio chunk")
+                    
+        finally:
+            processor_task.cancel()
+            sender_task.cancel()
+            
     except Exception as e:
         print("WebSocket error:", e)
         await websocket.close()
