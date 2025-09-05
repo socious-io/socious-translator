@@ -530,8 +530,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         settings = await websocket.receive_text()
-        config = json.loads(settings)
-        direction = config.get("direction")
+        client_config = json.loads(settings)
+        direction = client_config.get("direction")
 
         if direction == "en-ja":
             source_lang, target_lang = "English", "Japanese"
