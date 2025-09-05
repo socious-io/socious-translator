@@ -168,7 +168,30 @@ print(f"VAD Available: {HAS_WEBRTCVAD}")
 print(f"Caching Enabled: {config.ENABLE_CACHING}")
 print(f"Min Chunk Duration: {config.MIN_CHUNK_DURATION}s")
 print(f"Max Queue Size: {config.MAX_QUEUE_SIZE}")
+print(f"Beam Size: {config.BEAM_SIZE}")
+print(f"Model Object: {model}")
+print(f"Backup Model: {backup_model}")
 print("=" * 40)
+
+# Test model functionality
+print("🧪 Testing model functionality...")
+try:
+    if os.path.exists("/tmp/warm.wav"):
+        test_result = model.transcribe("/tmp/warm.wav", language="en")
+        if test_result and len(test_result) >= 2:
+            test_segments, test_info = test_result
+            if test_segments:
+                test_text = " ".join([segment.text for segment in test_segments]).strip()
+                print(f"✅ Model test successful: '{test_text}'")
+            else:
+                print("⚠️ Model test: No segments returned")
+        else:
+            print(f"⚠️ Model test: Unexpected result format: {test_result}")
+    else:
+        print("⚠️ No test file available for model verification")
+except Exception as test_error:
+    print(f"❌ Model test failed: {test_error}")
+print()
 
 app = FastAPI()
 app.add_middleware(
@@ -475,7 +498,10 @@ async def process_audio_chunk_fast(audio_data: bytes, source_lang: str, target_l
                 except:
                     return "", ""
                 
-                # Smart transcription with GPU failover
+                # Smart transcription with proper error handling
+                segments = None
+                transcription_info = None
+                
                 try:
                     global gpu_failure_count, model, backup_model, device_used
                     
@@ -489,7 +515,9 @@ async def process_audio_chunk_fast(audio_data: bytes, source_lang: str, target_l
                             print("🔄 Switching to CPU backup due to GPU failures")
                             device_used = "cpu_backup"
                     
-                    segments, _ = current_model.transcribe(
+                    print(f"🎤 Transcribing with {device_used} model...")
+                    
+                    result = current_model.transcribe(
                         wav_file.name,
                         language="en" if source_lang == "English" else "ja",
                         task=whisper_task,
@@ -498,11 +526,27 @@ async def process_audio_chunk_fast(audio_data: bytes, source_lang: str, target_l
                         condition_on_previous_text=False,
                     )
                     
+                    # Validate result
+                    if result is None:
+                        print("❌ Transcription returned None")
+                        return "", ""
+                    
+                    if isinstance(result, tuple) and len(result) >= 2:
+                        segments, transcription_info = result
+                    else:
+                        print(f"❌ Unexpected transcription result format: {type(result)}")
+                        return "", ""
+                    
                     # Reset failure count on success
                     if gpu_failure_count > 0:
                         gpu_failure_count = 0
+                        print(f"✅ GPU recovered after {gpu_failure_count} failures")
                         
                 except Exception as transcribe_error:
+                    print(f"❌ Transcription exception: {transcribe_error}")
+                    print(f"   Model: {current_model}")
+                    print(f"   File: {wav_file.name}")
+                    
                     # Handle GPU failures
                     if device_used == "cuda" and ("cuda" in str(transcribe_error).lower() or "cudnn" in str(transcribe_error).lower()):
                         gpu_failure_count += 1
@@ -511,7 +555,7 @@ async def process_audio_chunk_fast(audio_data: bytes, source_lang: str, target_l
                         if backup_model and gpu_failure_count <= MAX_GPU_FAILURES:
                             print("🔄 Retrying with CPU backup...")
                             try:
-                                segments, _ = backup_model.transcribe(
+                                result = backup_model.transcribe(
                                     wav_file.name,
                                     language="en" if source_lang == "English" else "ja",
                                     task=whisper_task,
@@ -519,34 +563,57 @@ async def process_audio_chunk_fast(audio_data: bytes, source_lang: str, target_l
                                     temperature=0.0,
                                     condition_on_previous_text=False,
                                 )
+                                
+                                if result and isinstance(result, tuple) and len(result) >= 2:
+                                    segments, transcription_info = result
+                                else:
+                                    print(f"❌ Backup model returned invalid result: {result}")
+                                    return "", ""
+                                    
                             except Exception as backup_error:
                                 print(f"❌ Backup model also failed: {backup_error}")
                                 return "", ""
                         else:
                             return "", ""
                     else:
-                        print(f"❌ Transcription failed: {transcribe_error}")
                         return "", ""
-                    
-                    # Extract text quickly
+                
+                # Validate segments
+                if not segments:
+                    print("❌ No segments returned from transcription")
+                    return "", ""
+                
+                # Extract text safely
+                try:
                     src_text = " ".join([segment.text for segment in segments]).strip()
                     
                     if not src_text:
+                        print("❌ Empty transcription text")
                         return "", ""
                     
-                    print(f"ASR ({direction}): {src_text}")
+                    print(f"✅ ASR ({direction}): {src_text}")
                     
                     # Skip basic filtering
                     if len(src_text) < 3:  # Too short
+                        print(f"❌ Text too short: '{src_text}'")
                         return "", ""
                     
-                    # Fast translation
+                    # Translation
                     if direction == "en-ja":
+                        print("🔄 Translating to Japanese...")
                         translated = await translate_text(src_text, source_lang, target_lang)
+                        if not translated:
+                            print("❌ Translation failed")
+                            return "", ""
+                        print(f"✅ Translation: {translated}")
                     else:
-                        translated = src_text
+                        translated = src_text  # Already English from Whisper
                     
                     return src_text, translated
+                    
+                except Exception as text_error:
+                    print(f"❌ Text processing error: {text_error}")
+                    return "", ""
                     
                 finally:
                     # Cleanup
