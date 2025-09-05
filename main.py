@@ -16,8 +16,8 @@ from collections import deque
 import config
 
 # Load performance preset - uncomment one of these:
-config.load_preset("speed")      # Fastest, lower quality - ENABLED FOR TESTING
-# config.load_preset("balanced")   # Default - good balance  
+# config.load_preset("speed")      # Fastest, lower quality
+config.load_preset("balanced")   # ENABLED: Best speed+quality balance  
 # config.load_preset("quality")    # Slower, highest quality
 # config.load_preset("original")   # Match your original setup
 
@@ -36,37 +36,119 @@ try:
 except:
     pass
 
-# Load whisper model with robust GPU detection
+# Comprehensive GPU diagnostics
+def diagnose_gpu():
+    """Diagnose CUDA/GPU availability and issues."""
+    print("🔍 GPU Diagnostics:")
+    
+    try:
+        import torch
+        print(f"  PyTorch version: {torch.__version__}")
+        print(f"  CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"  CUDA version: {torch.version.cuda}")
+            print(f"  cuDNN version: {torch.backends.cudnn.version()}")
+            print(f"  GPU count: {torch.cuda.device_count()}")
+            for i in range(torch.cuda.device_count()):
+                gpu_name = torch.cuda.get_device_name(i)
+                gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                print(f"  GPU {i}: {gpu_name} ({gpu_memory:.1f}GB)")
+        else:
+            print("  No CUDA devices found")
+    except Exception as e:
+        print(f"  PyTorch diagnostics failed: {e}")
+    
+    # Test cuDNN specifically
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # Test basic CUDA operation
+            x = torch.randn(10, 10).cuda()
+            y = torch.mm(x, x)
+            print("  ✅ Basic CUDA operations work")
+            
+            # Test cuDNN
+            if torch.backends.cudnn.enabled:
+                print("  ✅ cuDNN is enabled")
+                # Try a cuDNN operation
+                conv = torch.nn.Conv2d(1, 1, 3).cuda()
+                input_tensor = torch.randn(1, 1, 10, 10).cuda()
+                output = conv(input_tensor)
+                print("  ✅ cuDNN operations work")
+            else:
+                print("  ❌ cuDNN is disabled")
+    except Exception as e:
+        print(f"  ❌ CUDA/cuDNN test failed: {e}")
+    
+    print()
+
+# Run diagnostics
+diagnose_gpu()
+
+# Load whisper model with intelligent GPU handling
 model = None
 device_used = "cpu"
 compute_type_used = config.WHISPER_COMPUTE_TYPE
 
-# Try GPU first if set to "auto" or "cuda"
+# Try different GPU strategies if requested
 if config.WHISPER_DEVICE in ["auto", "cuda"]:
+    print("🚀 Attempting GPU acceleration...")
+    
+    # Strategy 1: Try CUDA with float16
     try:
-        print("Attempting to load GPU model...")
+        print("  Strategy 1: CUDA + float16")
         gpu_model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
-        # Quick test to ensure GPU actually works
+        # Quick test
         test_segments, _ = gpu_model.transcribe("/tmp/warm.wav", language="en")
         model = gpu_model
         device_used = "cuda"
         compute_type_used = "float16"
-        print("✅ Using GPU acceleration (CUDA)")
+        print("  ✅ Strategy 1 successful")
     except Exception as e:
-        print(f"❌ GPU failed: {e}")
-        print("Falling back to CPU...")
-        model = None
+        print(f"  ❌ Strategy 1 failed: {e}")
+        
+        # Strategy 2: Try CUDA with int8 (less memory intensive)
+        try:
+            print("  Strategy 2: CUDA + int8")
+            gpu_model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cuda", compute_type="int8")
+            test_segments, _ = gpu_model.transcribe("/tmp/warm.wav", language="en")
+            model = gpu_model  
+            device_used = "cuda"
+            compute_type_used = "int8"
+            print("  ✅ Strategy 2 successful")
+        except Exception as e:
+            print(f"  ❌ Strategy 2 failed: {e}")
+            
+            # Strategy 3: Force CPU with better performance
+            print("  Strategy 3: High-performance CPU fallback")
 
-# Fallback to CPU if GPU failed or not requested
+# Fallback to optimized CPU if GPU failed
 if model is None:
     try:
+        print("🖥️  Loading optimized CPU model...")
         model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
         device_used = "cpu"
         compute_type_used = "int8"
-        print("✅ Using CPU with int8 quantization")
+        print("✅ Using optimized CPU processing")
     except Exception as e:
         print(f"❌ Critical error loading model: {e}")
         raise
+
+print(f"🎯 Final configuration: {device_used} + {compute_type_used}")
+
+# Create backup CPU model for runtime failover if GPU fails
+backup_model = None
+if device_used == "cuda":
+    try:
+        print("🔄 Creating CPU backup model for failover...")
+        backup_model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+        print("✅ CPU backup model ready")
+    except Exception as e:
+        print(f"⚠️ Could not create backup model: {e}")
+
+# Runtime GPU failure counter
+gpu_failure_count = 0
+MAX_GPU_FAILURES = 3  # Switch to CPU after 3 consecutive failures
 
 # Warm up the model
 try:
@@ -333,9 +415,15 @@ async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
         if cached:
             return cached
     
-    # Simplified, much shorter prompt for speed
-    system = "Translate to natural Japanese. Return ONLY the translation."
-    user = f"Translate: {text}"
+    # Balanced prompt: better quality than simple, faster than complex
+    system = "You are a professional translator. Translate speech segments to natural, idiomatic Japanese maintaining the original tone and meaning. Return ONLY the translation."
+    
+    # Add minimal context for better quality
+    context = ""
+    if recent_src_segments:
+        context = f"\nPrevious: {recent_src_segments[-1]}" if recent_src_segments else ""
+    
+    user = f"Translate this English speech to Japanese:{context}\n\nText: {text}"
 
     try:
         resp = await client.chat.completions.create(
@@ -344,10 +432,14 @@ async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_completion_tokens=64,  # Reduced for speed
-            temperature=0.0  # Deterministic for consistency
+            max_completion_tokens=96,  # Balanced for quality
+            temperature=0.1  # Slight creativity for naturalness
         )
         translation = (resp.choices[0].message.content or "").strip()
+        
+        # Clean up any unwanted prefixes/formatting
+        if translation.startswith(("Translation:", "Japanese:", "「", "答：")):
+            translation = translation.split(":", 1)[-1].strip().strip("「」")
         
         # Cache the result if caching is enabled
         if config.ENABLE_CACHING:
@@ -383,16 +475,58 @@ async def process_audio_chunk_fast(audio_data: bytes, source_lang: str, target_l
                 except:
                     return "", ""
                 
-                # Fast transcription with minimal parameters
+                # Smart transcription with GPU failover
                 try:
-                    segments, _ = model.transcribe(
+                    global gpu_failure_count, model, backup_model, device_used
+                    
+                    # Use appropriate model
+                    current_model = model
+                    
+                    # If we've had too many GPU failures, switch to backup
+                    if gpu_failure_count >= MAX_GPU_FAILURES and backup_model:
+                        current_model = backup_model
+                        if device_used == "cuda":  # Only print once when switching
+                            print("🔄 Switching to CPU backup due to GPU failures")
+                            device_used = "cpu_backup"
+                    
+                    segments, _ = current_model.transcribe(
                         wav_file.name,
                         language="en" if source_lang == "English" else "ja",
                         task=whisper_task,
-                        beam_size=1,  # Fastest setting
+                        beam_size=config.BEAM_SIZE,
                         temperature=0.0,
                         condition_on_previous_text=False,
                     )
+                    
+                    # Reset failure count on success
+                    if gpu_failure_count > 0:
+                        gpu_failure_count = 0
+                        
+                except Exception as transcribe_error:
+                    # Handle GPU failures
+                    if device_used == "cuda" and ("cuda" in str(transcribe_error).lower() or "cudnn" in str(transcribe_error).lower()):
+                        gpu_failure_count += 1
+                        print(f"⚠️ GPU failure #{gpu_failure_count}: {transcribe_error}")
+                        
+                        if backup_model and gpu_failure_count <= MAX_GPU_FAILURES:
+                            print("🔄 Retrying with CPU backup...")
+                            try:
+                                segments, _ = backup_model.transcribe(
+                                    wav_file.name,
+                                    language="en" if source_lang == "English" else "ja",
+                                    task=whisper_task,
+                                    beam_size=config.BEAM_SIZE,
+                                    temperature=0.0,
+                                    condition_on_previous_text=False,
+                                )
+                            except Exception as backup_error:
+                                print(f"❌ Backup model also failed: {backup_error}")
+                                return "", ""
+                        else:
+                            return "", ""
+                    else:
+                        print(f"❌ Transcription failed: {transcribe_error}")
+                        return "", ""
                     
                     # Extract text quickly
                     src_text = " ".join([segment.text for segment in segments]).strip()

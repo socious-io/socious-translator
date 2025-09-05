@@ -47,10 +47,10 @@ PRESETS = {
     },
     "balanced": {
         "model": "medium",
-        "compute_type": "int8",
-        "beam_size": 1,  # Reduced for speed
+        "compute_type": "int8", 
+        "beam_size": 2,  # Balanced: better than 1, faster than 3+
         "vad_aggressiveness": 2,
-        "min_chunk_duration": 0.2
+        "min_chunk_duration": 0.3  # Slightly higher for better quality
     },
     "quality": {
         "model": "large-v3",
