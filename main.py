@@ -4,7 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
-import webrtcvad
+# webrtcvad import is optional
+try:
+    import webrtcvad
+    HAS_WEBRTCVAD = True
+except ImportError:
+    HAS_WEBRTCVAD = False
+    print("webrtcvad not available - using built-in VAD only")
 import numpy as np
 from collections import deque
 import config
@@ -68,8 +74,10 @@ SAMPLE_RATE = 16000
 translation_cache = {}
 CACHE_MAX_SIZE = 1000
 
-# VAD configuration
-vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
+# VAD configuration (optional)
+vad = None
+if HAS_WEBRTCVAD:
+    vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
 
 # Audio buffer for overlapping chunks
 audio_buffer = deque(maxlen=int(config.SAMPLE_RATE * 5))  # 5 second buffer
@@ -217,7 +225,18 @@ def cache_translation(text: str, source_lang: str, target_lang: str, translation
 
 
 def has_speech(audio_data: bytes, sample_rate: int = 16000) -> bool:
-    """Check if audio contains speech using WebRTC VAD."""
+    """Check if audio contains speech using WebRTC VAD (if available)."""
+    if not HAS_WEBRTCVAD or vad is None:
+        # If WebRTC VAD is not available, use simple energy-based detection
+        try:
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            # Simple energy-based voice activity detection
+            energy = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+            # Threshold for speech (adjust as needed)
+            return energy > 1000
+        except Exception:
+            return True
+    
     try:
         # Convert to numpy array
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
@@ -240,7 +259,7 @@ def has_speech(audio_data: bytes, sample_rate: int = 16000) -> bool:
                 speech_frames += 1
             total_frames += 1
         
-        # Return True if more than 30% of frames contain speech
+        # Return True if speech ratio exceeds threshold
         return speech_frames / total_frames > config.VAD_SPEECH_THRESHOLD if total_frames > 0 else False
     except Exception:
         # If VAD fails, assume there's speech
