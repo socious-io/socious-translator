@@ -21,17 +21,19 @@ RUN python -m pip install --no-cache-dir \
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-# --- Preload Whisper model into cache (persists in image)
+# --- Preload faster-whisper model into cache (persists in image)
 # This downloads model files into /opt/cache/whisper (because of XDG_CACHE_HOME)
 RUN python - <<'PY'
-import whisper, os
+from faster_whisper import WhisperModel
+import os
 print("Cache dir:", os.getenv("XDG_CACHE_HOME"))
-whisper.load_model("large-v3")
-print("Preloaded whisper model.")
+# Preload medium model (balanced speed/quality)
+model = WhisperModel("medium", device="cpu", compute_type="int8")
+print("Preloaded faster-whisper medium model.")
 PY
 
 # Verify (optional)
-RUN ls -lh ${XDG_CACHE_HOME}/whisper || true
+RUN ls -lh ${XDG_CACHE_HOME} || true
 
 # --- Copy app code last so edits don’t bust the cached model layer
 COPY . .
