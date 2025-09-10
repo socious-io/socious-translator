@@ -1,25 +1,8 @@
-import tempfile, subprocess, uvicorn, openai, os, json, uuid, re, asyncio, hashlib, time, io
+import tempfile, subprocess, uvicorn, openai, whisper, os, json, uuid, re
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
-from faster_whisper import WhisperModel
-# webrtcvad import is optional
-try:
-    import webrtcvad
-    HAS_WEBRTCVAD = True
-except ImportError:
-    HAS_WEBRTCVAD = False
-    print("webrtcvad not available - using built-in VAD only")
-import numpy as np
-from collections import deque
-import config
-
-# Load performance preset - uncomment one of these:
-# config.load_preset("speed")      # Fastest, lower quality
-config.load_preset("balanced")   # ENABLED: Best speed+quality balance  
-# config.load_preset("quality")    # Slower, highest quality
-# config.load_preset("original")   # Match your original setup
 
 # basic setup and client
 load_dotenv()
@@ -36,162 +19,12 @@ try:
 except:
     pass
 
-# Comprehensive GPU diagnostics
-def diagnose_gpu():
-    """Diagnose CUDA/GPU availability and issues."""
-    print("🔍 GPU Diagnostics:")
-    
-    try:
-        import torch
-        print(f"  PyTorch version: {torch.__version__}")
-        print(f"  CUDA available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            print(f"  CUDA version: {torch.version.cuda}")
-            print(f"  cuDNN version: {torch.backends.cudnn.version()}")
-            print(f"  GPU count: {torch.cuda.device_count()}")
-            for i in range(torch.cuda.device_count()):
-                gpu_name = torch.cuda.get_device_name(i)
-                gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
-                print(f"  GPU {i}: {gpu_name} ({gpu_memory:.1f}GB)")
-        else:
-            print("  No CUDA devices found")
-    except Exception as e:
-        print(f"  PyTorch diagnostics failed: {e}")
-    
-    # Test cuDNN specifically
-    try:
-        import torch
-        if torch.cuda.is_available():
-            # Test basic CUDA operation
-            x = torch.randn(10, 10).cuda()
-            y = torch.mm(x, x)
-            print("  ✅ Basic CUDA operations work")
-            
-            # Test cuDNN
-            if torch.backends.cudnn.enabled:
-                print("  ✅ cuDNN is enabled")
-                # Try a cuDNN operation
-                conv = torch.nn.Conv2d(1, 1, 3).cuda()
-                input_tensor = torch.randn(1, 1, 10, 10).cuda()
-                output = conv(input_tensor)
-                print("  ✅ cuDNN operations work")
-            else:
-                print("  ❌ cuDNN is disabled")
-    except Exception as e:
-        print(f"  ❌ CUDA/cuDNN test failed: {e}")
-    
-    print()
-
-# Run diagnostics
-diagnose_gpu()
-
-# Load whisper model with intelligent GPU handling
-model = None
-device_used = "cpu"
-compute_type_used = config.WHISPER_COMPUTE_TYPE
-
-# Try different GPU strategies if requested
-if config.WHISPER_DEVICE in ["auto", "cuda"]:
-    print("🚀 Attempting GPU acceleration...")
-    
-    # Strategy 1: Try CUDA with float16
-    try:
-        print("  Strategy 1: CUDA + float16")
-        gpu_model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
-        # Quick test
-        test_segments, _ = gpu_model.transcribe("/tmp/warm.wav", language="en")
-        model = gpu_model
-        device_used = "cuda"
-        compute_type_used = "float16"
-        print("  ✅ Strategy 1 successful")
-    except Exception as e:
-        print(f"  ❌ Strategy 1 failed: {e}")
-        
-        # Strategy 2: Try CUDA with int8 (less memory intensive)
-        try:
-            print("  Strategy 2: CUDA + int8")
-            gpu_model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cuda", compute_type="int8")
-            test_segments, _ = gpu_model.transcribe("/tmp/warm.wav", language="en")
-            model = gpu_model  
-            device_used = "cuda"
-            compute_type_used = "int8"
-            print("  ✅ Strategy 2 successful")
-        except Exception as e:
-            print(f"  ❌ Strategy 2 failed: {e}")
-            
-            # Strategy 3: Force CPU with better performance
-            print("  Strategy 3: High-performance CPU fallback")
-
-# Fallback to optimized CPU if GPU failed
-if model is None:
-    try:
-        print("🖥️  Loading optimized CPU model...")
-        model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-        device_used = "cpu"
-        compute_type_used = "int8"
-        print("✅ Using optimized CPU processing")
-    except Exception as e:
-        print(f"❌ Critical error loading model: {e}")
-        raise
-
-print(f"🎯 Final configuration: {device_used} + {compute_type_used}")
-
-# Create backup CPU model for runtime failover if GPU fails
-backup_model = None
-if device_used == "cuda":
-    try:
-        print("🔄 Creating CPU backup model for failover...")
-        backup_model = WhisperModel(config.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-        print("✅ CPU backup model ready")
-    except Exception as e:
-        print(f"⚠️ Could not create backup model: {e}")
-
-# Runtime GPU failure counter
-gpu_failure_count = 0
-MAX_GPU_FAILURES = 3  # Switch to CPU after 3 consecutive failures
-
-# Warm up the model
+# load whisper once
+model = whisper.load_model("large-v3")
 try:
-    segments, _ = model.transcribe("/tmp/warm.wav", language="en")
-    print("Model warmed up successfully")
-except Exception as e:
-    print(f"Model warmup failed: {e}")
+    model.transcribe("/tmp/warm.wav", language="en", fp16=True)
+except:
     pass
-
-# Print configuration summary
-print(f"=== Translation System Configuration ===")
-print(f"Whisper Model: {config.WHISPER_MODEL_SIZE}")
-print(f"Device: {device_used}")
-print(f"Compute Type: {compute_type_used}")
-print(f"Translation Model: {config.TRANSLATION_MODEL}")
-print(f"VAD Available: {HAS_WEBRTCVAD}")
-print(f"Caching Enabled: {config.ENABLE_CACHING}")
-print(f"Min Chunk Duration: {config.MIN_CHUNK_DURATION}s")
-print(f"Max Queue Size: {config.MAX_QUEUE_SIZE}")
-print(f"Beam Size: {config.BEAM_SIZE}")
-print(f"Model Object: {model}")
-print(f"Backup Model: {backup_model}")
-print("=" * 40)
-
-# Test model functionality
-print("🧪 Testing model functionality...")
-try:
-    if os.path.exists("/tmp/warm.wav"):
-        test_result = model.transcribe("/tmp/warm.wav", language="en")
-        if test_result and len(test_result) >= 2:
-            test_segments, test_info = test_result
-            if test_segments:
-                test_text = " ".join([segment.text for segment in test_segments]).strip()
-                print(f"✅ Model test successful: '{test_text}'")
-            else:
-                print("⚠️ Model test: No segments returned")
-        else:
-            print(f"⚠️ Model test: Unexpected result format: {test_result}")
-    else:
-        print("⚠️ No test file available for model verification")
-except Exception as test_error:
-    print(f"❌ Model test failed: {test_error}")
-print()
 
 app = FastAPI()
 app.add_middleware(
@@ -203,19 +36,8 @@ app.add_middleware(
 # tiny context buffers for current-line translation only
 recent_src_segments: list[str] = []
 recent_targets: list[str] = []
-
-# All configuration now handled by config.py module
-
-# Translation cache
-translation_cache = {}
-
-# VAD configuration (optional)
-vad = None
-if HAS_WEBRTCVAD:
-    vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
-
-# Audio buffer for overlapping chunks
-audio_buffer = deque(maxlen=int(config.SAMPLE_RATE * 5))  # 5 second buffer
+MAX_SRC_CTX = 2
+MAX_RECENT = 10
 
 # exact short interjections only (and standalone "you")
 THANKS_RE = re.compile(
@@ -335,298 +157,104 @@ def is_cta_like(text: str) -> bool:
     return any(rx.search(text) for rx in _CTA_REGEXES)
 
 
-def get_cache_key(text: str, source_lang: str, target_lang: str) -> str:
-    """Generate cache key for translation."""
-    content = f"{text}|{source_lang}|{target_lang}"
-    return hashlib.md5(content.encode()).hexdigest()
-
-
-def get_cached_translation(text: str, source_lang: str, target_lang: str) -> str:
-    """Get cached translation if available."""
-    key = get_cache_key(text, source_lang, target_lang)
-    return translation_cache.get(key)
-
-
-def cache_translation(text: str, source_lang: str, target_lang: str, translation: str):
-    """Cache translation with LRU eviction."""
-    key = get_cache_key(text, source_lang, target_lang)
-    
-    if len(translation_cache) >= config.CACHE_MAX_SIZE:
-        # Remove oldest entry
-        oldest_key = next(iter(translation_cache))
-        del translation_cache[oldest_key]
-    
-    translation_cache[key] = translation
-
-
-def has_speech(audio_data: bytes, sample_rate: int = 16000) -> bool:
-    """Check if audio contains speech using WebRTC VAD (if available)."""
-    if not HAS_WEBRTCVAD or vad is None:
-        # If WebRTC VAD is not available, use simple energy-based detection
-        try:
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            # Simple energy-based voice activity detection
-            energy = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
-            # Threshold for speech (adjust as needed)
-            has_activity = energy > 1000
-            # Uncomment for debugging: print(f"Energy VAD: {energy:.1f}, has_speech: {has_activity}")
-            return has_activity
-        except Exception as e:
-            print(f"VAD fallback error: {e}")
-            return True
-    
-    try:
-        # Convert to numpy array
-        audio_array = np.frombuffer(audio_data, dtype=np.int16)
-        
-        # VAD requires specific frame sizes (10ms, 20ms, 30ms)
-        frame_duration = 30  # ms
-        frame_size = int(sample_rate * frame_duration / 1000)
-        
-        # Check if we have enough data
-        if len(audio_array) < frame_size:
-            return False
-        
-        # Process in 30ms frames
-        speech_frames = 0
-        total_frames = 0
-        
-        for i in range(0, len(audio_array) - frame_size, frame_size):
-            frame = audio_array[i:i + frame_size]
-            if vad.is_speech(frame.tobytes(), sample_rate):
-                speech_frames += 1
-            total_frames += 1
-        
-        # Return True if speech ratio exceeds threshold
-        return speech_frames / total_frames > config.VAD_SPEECH_THRESHOLD if total_frames > 0 else False
-    except Exception:
-        # If VAD fails, assume there's speech
-        return True
-
-
-def convert_audio_in_memory(input_data: bytes) -> bytes:
-    """Convert audio to WAV format in memory using FFmpeg."""
-    try:
-        process = subprocess.Popen(
-            ["ffmpeg", "-i", "pipe:0", "-ar", str(config.SAMPLE_RATE), "-ac", "1", "-f", "wav", "pipe:1"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
-        
-        wav_data, _ = process.communicate(input=input_data)
-        return wav_data if process.returncode == 0 else b""
-    except Exception:
-        return b""
-
-
-def get_audio_duration(wav_data: bytes) -> float:
-    """Get duration of WAV audio data in seconds."""
-    try:
-        # Skip WAV header (44 bytes) and calculate duration
-        audio_data = wav_data[44:]  # Skip WAV header
-        num_samples = len(audio_data) // 2  # 16-bit samples
-        return num_samples / config.SAMPLE_RATE
-    except Exception:
-        return 0.0
-
-
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
-    # Check cache first if enabled
-    if config.ENABLE_CACHING:
-        cached = get_cached_translation(text, source_lang, target_lang)
-        if cached:
-            return cached
-    
-    # Balanced prompt: better quality than simple, faster than complex
-    system = "You are a professional translator. Translate speech segments to natural, idiomatic Japanese maintaining the original tone and meaning. Return ONLY the translation."
-    
-    # Add minimal context for better quality
-    context = ""
-    if recent_src_segments:
-        context = f"\nPrevious: {recent_src_segments[-1]}" if recent_src_segments else ""
-    
-    user = f"Translate this English speech to Japanese:{context}\n\nText: {text}"
+    source_context = " ".join(recent_src_segments[-MAX_SRC_CTX:])
+    recent_target_str = "\n".join(recent_targets[-MAX_RECENT:])
+
+    system = "Translate live ASR segments into natural, idiomatic target-language captions. Return ONLY the translation text."
+    user = f"""
+You are translating a single ASR segment from English → Japanese.
+
+<goal>
+Produce fluent, idiomatic {target_lang} for THIS single ASR segment only. Preserve original word strength, tone, and register. Use context only to resolve ambiguous pronouns or cut-offs.
+</goal>
+
+<context_use>
+- Use <source_context> only for ambiguity in pronouns/ellipses/cut-offs.
+- Do not merge or restate earlier material beyond what’s needed for this segment.
+- If input repeats a clause from <source_context>, keep it once in the cleanest form.
+- Do not re-translate content already fully covered in <recent_target> unless new info is added.
+</context_use>
+
+<priorities>
+1) Fidelity first — preserve meaning and *emotional strength*.
+2) No intensity shifts (e.g., “annoyed” ≠ 「激怒」; “kind of good” ≠ 「最高」).
+3) Don’t invent filler, asides, or emphasis not in the source.
+4) Match register/politeness exactly (casual/neutral/formal).
+5) Overlap handling — remove duplicated words; don’t paraphrase earlier material unless literally repeated here.
+6) Numbers/units/symbols/proper names — keep digits/symbols; use established JP renderings or one consistent form.
+7) Describe nonverbal events only if explicitly audible/mentioned.
+8) If input is already {target_lang}, return unchanged.
+9) Labels/titles/meta — translate as labels/titles; don’t expand to full sentences.
+10) Preserve grammatical person/mood; don’t add/soften/strengthen imperatives or politeness.
+11) Drop standalone low-content interjections (“uh/erm”); keep one token max if needed (e.g., 「えっと」).
+12) Consistency — keep proper-noun spellings consistent across the session.
+13) Redundancy — if fully covered in <recent_target> with no new detail, output nothing.
+</priorities>
+
+<style_targets>
+- 明確・簡潔。
+- 自然だが、意味・トーン・強度は一切変更しない。
+- 脚色・強調・コメントは加えない。
+</style_targets>
+
+<source_context>
+{source_context}
+</source_context>
+
+<recent_target>
+{recent_target_str}
+</recent_target>
+
+<examples_positive>
+<input>Please double-check the numbers.</input>
+<output>数値を再確認してください。</output>
+
+<input>It’s kind of slow—nothing on screen yet.</input>
+<output>少し遅いですね。まだ画面に何も表示されていません。</output>
+
+<input>We may roll it back if needed.</input>
+<output>必要であればロールバックする可能性があります。</output>
+</examples_positive>
+
+<examples_boundary>
+<input>Could you fix it?</input>
+<bad_output>すぐに直してください！</bad_output>
+<why>Intensity was upgraded.</why>
+<good_output>修正してもらえますか。</good_output>
+
+<input>Do it.</input>
+<bad_output>やっていただけますか。</bad_output>
+<why>Imperative was softened.</why>
+<good_output>やれ。</good_output>
+</examples_boundary>
+
+<target_lang>日本語</target_lang>
+
+<input>
+{text}
+</input>
+
+""".strip()
 
     try:
         resp = await client.chat.completions.create(
-            model=config.TRANSLATION_MODEL,
+            model="gpt-5",
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_completion_tokens=96,  # Balanced for quality
-            temperature=0.1  # Slight creativity for naturalness
+            reasoning_effort="minimal",
+            max_completion_tokens=128
         )
-        translation = (resp.choices[0].message.content or "").strip()
-        
-        # Clean up any unwanted prefixes/formatting
-        if translation.startswith(("Translation:", "Japanese:", "「", "答：")):
-            translation = translation.split(":", 1)[-1].strip().strip("「」")
-        
-        # Cache the result if caching is enabled
-        if config.ENABLE_CACHING:
-            cache_translation(text, source_lang, target_lang, translation)
-        
-        return translation
+        return (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        print(f"Translation error: {e}")
-        return text  # Return original on error
+        print("Translation error:", e)
+        return ""
 
 @app.get("/")
 async def serve_index():
     return FileResponse(os.path.join("frontend", "index.html"))
-
-async def process_audio_chunk_fast(audio_data: bytes, source_lang: str, target_lang: str, whisper_task: str, direction: str) -> tuple[str, str]:
-    """Process audio chunk with minimal overhead for speed."""
-    try:
-        # Direct file write without extra checks for speed
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as raw_file:
-            raw_file.write(audio_data)
-            raw_file.flush()
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_file:
-                # Fast conversion
-                try:
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-i", raw_file.name, "-ar", str(config.SAMPLE_RATE), "-ac", "1", wav_file.name],
-                        stdout=subprocess.DEVNULL, 
-                        stderr=subprocess.DEVNULL, 
-                        check=True,
-                        timeout=5  # 5 second timeout
-                    )
-                except:
-                    return "", ""
-                
-                # Smart transcription with proper error handling
-                segments = None
-                transcription_info = None
-                
-                try:
-                    global gpu_failure_count, model, backup_model, device_used
-                    
-                    # Use appropriate model
-                    current_model = model
-                    
-                    # If we've had too many GPU failures, switch to backup
-                    if gpu_failure_count >= MAX_GPU_FAILURES and backup_model:
-                        current_model = backup_model
-                        if device_used == "cuda":  # Only print once when switching
-                            print("🔄 Switching to CPU backup due to GPU failures")
-                            device_used = "cpu_backup"
-                    
-                    print(f"🎤 Transcribing with {device_used} model...")
-                    
-                    result = current_model.transcribe(
-                        wav_file.name,
-                        language="en" if source_lang == "English" else "ja",
-                        task=whisper_task,
-                        beam_size=config.BEAM_SIZE,
-                        temperature=0.0,
-                        condition_on_previous_text=False,
-                    )
-                    
-                    # Validate result
-                    if result is None:
-                        print("❌ Transcription returned None")
-                        return "", ""
-                    
-                    if isinstance(result, tuple) and len(result) >= 2:
-                        segments, transcription_info = result
-                    else:
-                        print(f"❌ Unexpected transcription result format: {type(result)}")
-                        return "", ""
-                    
-                    # Reset failure count on success
-                    if gpu_failure_count > 0:
-                        gpu_failure_count = 0
-                        print(f"✅ GPU recovered after {gpu_failure_count} failures")
-                        
-                except Exception as transcribe_error:
-                    print(f"❌ Transcription exception: {transcribe_error}")
-                    print(f"   Model: {current_model}")
-                    print(f"   File: {wav_file.name}")
-                    
-                    # Handle GPU failures
-                    if device_used == "cuda" and ("cuda" in str(transcribe_error).lower() or "cudnn" in str(transcribe_error).lower()):
-                        gpu_failure_count += 1
-                        print(f"⚠️ GPU failure #{gpu_failure_count}: {transcribe_error}")
-                        
-                        if backup_model and gpu_failure_count <= MAX_GPU_FAILURES:
-                            print("🔄 Retrying with CPU backup...")
-                            try:
-                                result = backup_model.transcribe(
-                                    wav_file.name,
-                                    language="en" if source_lang == "English" else "ja",
-                                    task=whisper_task,
-                                    beam_size=config.BEAM_SIZE,
-                                    temperature=0.0,
-                                    condition_on_previous_text=False,
-                                )
-                                
-                                if result and isinstance(result, tuple) and len(result) >= 2:
-                                    segments, transcription_info = result
-                                else:
-                                    print(f"❌ Backup model returned invalid result: {result}")
-                                    return "", ""
-                                    
-                            except Exception as backup_error:
-                                print(f"❌ Backup model also failed: {backup_error}")
-                                return "", ""
-                        else:
-                            return "", ""
-                    else:
-                        return "", ""
-                
-                # Validate segments
-                if not segments:
-                    print("❌ No segments returned from transcription")
-                    return "", ""
-                
-                # Extract text safely
-                try:
-                    src_text = " ".join([segment.text for segment in segments]).strip()
-                    
-                    if not src_text:
-                        print("❌ Empty transcription text")
-                        return "", ""
-                    
-                    print(f"✅ ASR ({direction}): {src_text}")
-                    
-                    # Skip basic filtering
-                    if len(src_text) < 3:  # Too short
-                        print(f"❌ Text too short: '{src_text}'")
-                        return "", ""
-                    
-                    # Translation
-                    if direction == "en-ja":
-                        print("🔄 Translating to Japanese...")
-                        translated = await translate_text(src_text, source_lang, target_lang)
-                        if not translated:
-                            print("❌ Translation failed")
-                            return "", ""
-                        print(f"✅ Translation: {translated}")
-                    else:
-                        translated = src_text  # Already English from Whisper
-                    
-                    return src_text, translated
-                    
-                except Exception as text_error:
-                    print(f"❌ Text processing error: {text_error}")
-                    return "", ""
-                    
-                finally:
-                    # Cleanup
-                    try:
-                        os.unlink(raw_file.name)
-                        os.unlink(wav_file.name)
-                    except:
-                        pass
-                        
-    except Exception as e:
-        print(f"Fast processing error: {e}")
-        return "", ""
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -635,8 +263,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         settings = await websocket.receive_text()
-        client_config = json.loads(settings)
-        direction = client_config.get("direction")
+        config = json.loads(settings)
+        direction = config.get("direction")
 
         if direction == "en-ja":
             source_lang, target_lang = "English", "Japanese"
@@ -648,44 +276,85 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
 
-        print(f"Processing {direction} translation")
-
-        # Simple direct processing for speed
         while True:
-            try:
-                msg = await websocket.receive()
-                if "bytes" not in msg:
-                    continue
+            msg = await websocket.receive()
+            if "bytes" not in msg:
+                continue
 
-                audio = msg["bytes"]
-                if not audio or len(audio) < 1000:  # Skip very small chunks
-                    continue
+            audio = msg["bytes"]
+            if not audio:
+                continue
 
-                # Process directly without queue overhead
-                src_text, translated = await process_audio_chunk_fast(
-                    audio, source_lang, target_lang, whisper_task, direction
-                )
-                
-                if src_text and translated:
-                    # Update context quickly
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as raw:
+                raw.write(audio)
+                raw.flush()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav:
+                    try:
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", raw.name, "-ar", "16000", "-ac", "1", wav.name],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True
+                        )
+                    except:
+                        continue
+
+                    result = model.transcribe(
+                        wav.name,
+                        fp16=True,
+                        temperature=0.0,
+                        beam_size=5,
+                        condition_on_previous_text=False,
+                        hallucination_silence_threshold=0.30,
+                        no_speech_threshold=0.6,
+                        language="en" if source_lang == "English" else "ja",
+                        compression_ratio_threshold=1.7,
+                        logprob_threshold=-0.3,
+                        task=whisper_task,
+                    )
+
+                    src_text = (result.get("text") or "").strip()
+                    if not src_text:
+                        continue
+                    print("ASR:", src_text)
+
+                    if is_interjection_thanks(src_text):
+                        print("Skipped short thank-you interjection (source).")
+                        continue
+                    if is_cta_like(src_text):
+                        print("Dropped CTA/meta filler (source).")
+                        continue
+
+                    segment_id = str(uuid.uuid4())
+
+                    if direction == "en-ja":
+                        translated = await translate_text(src_text, source_lang, target_lang)
+                    else:
+                        translated = src_text  # Whisper already gave English
+
+                    if is_interjection_thanks(translated):
+                        print("Skipped short thank-you interjection (target).")
+                        continue
+                    if is_cta_like(translated):
+                        print("Dropped CTA/meta filler (target).")
+                        continue
+
+                    translated = translated.strip()
+                    if not translated or not re.search(r'[A-Za-z0-9ぁ-んァ-ン一-龯々ー]', translated):
+                        print("Suppressed empty/no-op output.")
+                        continue
+
+                    # update tiny context buffers only when emitting
                     recent_src_segments.append(src_text)
-                    if len(recent_src_segments) > config.MAX_SRC_CTX * 3:
+                    if len(recent_src_segments) > MAX_SRC_CTX * 3:
                         recent_src_segments.pop(0)
 
                     recent_targets.append(translated)
-                    if len(recent_targets) > config.MAX_RECENT:
+                    if len(recent_targets) > MAX_RECENT:
                         recent_targets.pop(0)
 
-                    # Send immediately
-                    segment_id = str(uuid.uuid4())
                     await websocket.send_text(f"[DONE]{json.dumps({'id': segment_id, 'text': translated})}")
-                        
-            except Exception as e:
-                print(f"Processing error: {e}")
-                continue  # Keep going on individual errors
-            
+
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print("WebSocket error:", e)
         await websocket.close()
 
 if __name__ == "__main__":
