@@ -57,7 +57,7 @@
     let socket = null;
     let recording = false;
 
-    const MAX_CHARS = 400; // cap the paragraph length for live readability
+    const MAX_CHARS = 200; // cap the paragraph length for live readability
 
     // FIXED: use a template literal for WebSocket URL
     function wsUrl() {
@@ -216,38 +216,41 @@
     }
 
     async function recordLoop(mimeType) {
-      while (recording) {
-        // Create a short-lived recorder for chunked uploads
-        let recorder;
-        try {
-          recorder = new MediaRecorder(mediaStream, { mimeType });
-        } catch (e) {
-          console.error("Failed to create MediaRecorder:", e);
-          setStatus("Failed to create MediaRecorder");
-          stopRecording();
-          return;
-        }
-
-        recorder.ondataavailable = async (e) => {
-          if (e.data && e.data.size > 0 && socket?.readyState === WebSocket.OPEN) {
-            try {
-              const buf = await e.data.arrayBuffer();
-              socket.send(buf);
-            } catch (err) {
-              console.warn("send buffer error:", err);
-            }
-          }
-        };
-
-        recorder.start();
-        await new Promise((resolve) => {
-          setTimeout(() => {
-            try { recorder.stop(); } catch {}
-            resolve();
-          }, 3800); // ~3.8s chunks
-        });
+      let recorder;
+      try {
+        recorder = new MediaRecorder(mediaStream, { mimeType });
+      } catch (e) {
+        console.error("Failed to create MediaRecorder:", e);
+        setStatus("Failed to create MediaRecorder");
+        stopRecording();
+        return;
       }
+
+      recorder.ondataavailable = async (e) => {
+        if (e.data && e.data.size > 0 && socket?.readyState === WebSocket.OPEN) {
+          try {
+            const buf = await e.data.arrayBuffer();
+            socket.send(buf);
+          } catch (err) {
+            console.warn("send buffer error:", err);
+          }
+        }
+      };
+
+      // Emit chunks automatically every second, even in background tabs
+      try { recorder.start(1000); } catch (e) {
+        console.error("MediaRecorder start failed:", e);
+        setStatus("MediaRecorder start failed");
+        stopRecording();
+        return;
+      }
+
+      // Keep this function alive so the recorder isn’t GC’d; resolves when stopRecording() stops tracks
+      await new Promise((resolve) => {
+        recorder.onstop = resolve;
+      });
     }
+
 
     function stopRecording() {
       recording = false;
