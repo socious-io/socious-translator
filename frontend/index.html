@@ -94,11 +94,21 @@
     }
 
     function trimToMaxChars() {
-      // Remove oldest segments until under MAX_CHARS
-      while (totalChars() > MAX_CHARS && committed.firstElementChild) {
-        committed.removeChild(committed.firstElementChild);
+      let extra = totalChars() - MAX_CHARS;
+      while (extra > 0 && committed.firstChild) {
+        const node = committed.firstChild;
+        const txt = node.textContent || "";
+        if (txt.length <= extra) {
+          committed.removeChild(node);
+          extra -= txt.length;
+        } else {
+          // trim from the start of this node so the total visible chars == MAX_CHARS
+          node.textContent = txt.slice(extra);
+          extra = 0;
+        }
       }
     }
+
 
     function commitFinal(text, id = null) {
       const span = document.createElement("span");
