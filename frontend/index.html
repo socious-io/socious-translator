@@ -61,7 +61,8 @@
 
     // use a template literal for WebSocket URL
     function wsUrl() {
-      return location.origin.replace(/^http/, "ws") + "/ws";
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      return `${proto}://${location.host}/ws`;
     }
 
 
