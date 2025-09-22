@@ -249,7 +249,7 @@
       };
 
       // Emit chunks automatically every second, even in background tabs
-      try { recorder.start(1000); } catch (e) {
+      try { recorder.start(3800); } catch (e) {
         console.error("MediaRecorder start failed:", e);
         setStatus("MediaRecorder start failed");
         stopRecording();
