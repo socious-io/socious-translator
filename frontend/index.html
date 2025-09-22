@@ -59,11 +59,11 @@
 
     const MAX_CHARS = 110; // cap the paragraph length for live readability
 
-    // FIXED: use a template literal for WebSocket URL
+    // use a template literal for WebSocket URL
     function wsUrl() {
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      return `${proto}://${location.host}/ws`;
+      return location.origin.replace(/^http/, "ws") + "/ws";
     }
+
 
     directionSelect.onchange = () => stopRecording();
 
