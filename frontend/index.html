@@ -259,8 +259,8 @@
       };
 
       try {
-        // 1s slices keep firing in background; we batch/flush ourselves
-        recorder.start(1000);
+        // 3.8s slices keep firing in background; we batch/flush ourselves
+        recorder.start(3800);
       } catch (e) {
         console.error("MediaRecorder start failed:", e);
         setStatus("MediaRecorder start failed");
