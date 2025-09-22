@@ -217,7 +217,6 @@
 
     async function recordLoop(mimeType) {
       while (recording) {
-        // Create a short-lived recorder for chunked uploads
         let recorder;
         try {
           recorder = new MediaRecorder(mediaStream, { mimeType });
@@ -228,26 +227,69 @@
           return;
         }
 
-        recorder.ondataavailable = async (e) => {
-          if (e.data && e.data.size > 0 && socket?.readyState === WebSocket.OPEN) {
-            try {
-              const buf = await e.data.arrayBuffer();
-              socket.send(buf);
-            } catch (err) {
-              console.warn("send buffer error:", err);
-            }
+        // accumulate ~4s of audio; stop based on elapsed time OR pieces OR size
+        let chunks = [];
+        let bytes = 0;
+        const startedAt = performance.now();
+
+        const flush = async () => {
+          if (!chunks.length || socket?.readyState !== WebSocket.OPEN) return;
+          try {
+            const blob = new Blob(chunks, { type: chunks[0]?.type || mimeType });
+            const buf = await blob.arrayBuffer();
+            socket.send(buf);
+          } catch (err) {
+            console.warn("final flush error:", err);
+          } finally {
+            chunks = [];
+            bytes = 0;
           }
         };
 
-        recorder.start();
+        recorder.ondataavailable = (e) => {
+          if (!e.data || e.data.size === 0) return;
+          chunks.push(e.data);
+          bytes += e.data.size;
+
+          const elapsed = performance.now() - startedAt;
+
+          // Stop when we have ~4s, OR enough callbacks, OR a "big enough" blob
+          if (
+            elapsed >= 3800 ||
+            chunks.length >= 4 ||
+            bytes >= 220_000 // safety for coalesced callbacks
+          ) {
+            // Defer stop out of the handler for robustness
+            queueMicrotask(() => {
+              if (recorder.state === "recording") {
+                try { recorder.stop(); } catch {}
+              }
+            });
+          }
+        };
+
+        recorder.onstop = async () => {
+          // send whatever we accumulated for this ~4s window
+          await flush();
+        };
+
+        try {
+          // 1s timeslice fires in background; we decide when to stop
+          recorder.start(1000);
+        } catch (e) {
+          console.error("MediaRecorder start failed:", e);
+          setStatus("MediaRecorder start failed");
+          stopRecording();
+          return;
+        }
+
+        // Wait until this short-lived recorder stops, then loop
         await new Promise((resolve) => {
-          setTimeout(() => {
-            try { recorder.stop(); } catch {}
-            resolve();
-          }, 3800); // ~3.8s chunks
+          recorder.addEventListener("stop", resolve, { once: true });
         });
       }
     }
+
 
     function stopRecording() {
       recording = false;
