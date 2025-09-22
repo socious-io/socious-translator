@@ -237,30 +237,56 @@
         return;
       }
 
-      recorder.ondataavailable = async (e) => {
-        if (e.data && e.data.size > 0 && socket?.readyState === WebSocket.OPEN) {
-          try {
-            const buf = await e.data.arrayBuffer();
-            socket.send(buf);
-          } catch (err) {
-            console.warn("send buffer error:", err);
-          }
+      // accumulate ~4s before sending
+      let acc = [];
+      let accBytes = 0;
+      const FLUSH_MS = 3800;
+
+      function flush(now = performance.now()) {
+        if (!acc.length || socket?.readyState !== WebSocket.OPEN) return;
+        const blob = new Blob(acc, { type: acc[0].type || mimeType });
+        acc = [];
+        accBytes = 0;
+        blob.arrayBuffer().then(buf => socket.send(buf)).catch(err => {
+          console.warn("send buffer error:", err);
+        });
+        lastFlush = now;
+      }
+
+      let lastFlush = performance.now();
+
+      recorder.ondataavailable = (e) => {
+        if (!e.data || e.data.size === 0) return;
+        acc.push(e.data);
+        accBytes += e.data.size;
+
+        const now = performance.now();
+        // flush if we've got ~4s of audio or it’s been ~3.8s since last flush
+        if (accBytes > 0 && (now - lastFlush >= FLUSH_MS || acc.length >= 4)) {
+          flush(now);
         }
       };
 
-      // Emit chunks automatically every second, even in background tabs
-      try { recorder.start(3800); } catch (e) {
+      // ensure we still flush occasionally (e.g., when page is backgrounded)
+      const flushTimer = setInterval(() => flush(), 1000);
+
+      try { recorder.start(1000); } catch (e) {
         console.error("MediaRecorder start failed:", e);
         setStatus("MediaRecorder start failed");
+        clearInterval(flushTimer);
         stopRecording();
         return;
       }
 
-      // Keep this function alive so the recorder isn’t GC’d; resolves when stopRecording() stops tracks
       await new Promise((resolve) => {
-        recorder.onstop = resolve;
+        recorder.onstop = () => {
+          clearInterval(flushTimer);
+          flush(); // send any final buffered audio
+          resolve();
+        };
       });
     }
+
 
 
     function stopRecording() {
