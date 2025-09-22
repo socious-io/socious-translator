@@ -227,65 +227,38 @@
     }
 
     async function recordLoop(mimeType) {
-      let recorder;
-      try {
-        recorder = new MediaRecorder(mediaStream, { mimeType });
-      } catch (e) {
-        console.error("Failed to create MediaRecorder:", e);
-        setStatus("Failed to create MediaRecorder");
-        stopRecording();
-        return;
-      }
+        while (recording) {
+          // Create a short-lived recorder for chunked uploads
+          let recorder;
+          try {
+            recorder = new MediaRecorder(mediaStream, { mimeType });
+          } catch (e) {
+            console.error("Failed to create MediaRecorder:", e);
+            setStatus("Failed to create MediaRecorder");
+            stopRecording();
+            return;
+          }
 
-      // accumulate ~4s before sending
-      let acc = [];
-      let accBytes = 0;
-      const FLUSH_MS = 3800;
+          recorder.ondataavailable = async (e) => {
+            if (e.data && e.data.size > 0 && socket?.readyState === WebSocket.OPEN) {
+              try {
+                const buf = await e.data.arrayBuffer();
+                socket.send(buf);
+              } catch (err) {
+                console.warn("send buffer error:", err);
+              }
+            }
+          };
 
-      function flush(now = performance.now()) {
-        if (!acc.length || socket?.readyState !== WebSocket.OPEN) return;
-        const blob = new Blob(acc, { type: acc[0].type || mimeType });
-        acc = [];
-        accBytes = 0;
-        blob.arrayBuffer().then(buf => socket.send(buf)).catch(err => {
-          console.warn("send buffer error:", err);
-        });
-        lastFlush = now;
-      }
-
-      let lastFlush = performance.now();
-
-      recorder.ondataavailable = (e) => {
-        if (!e.data || e.data.size === 0) return;
-        acc.push(e.data);
-        accBytes += e.data.size;
-
-        const now = performance.now();
-        // flush if we've got ~4s of audio or it’s been ~3.8s since last flush
-        if (accBytes > 0 && (now - lastFlush >= FLUSH_MS || acc.length >= 4)) {
-          flush(now);
+          recorder.start();
+          await new Promise((resolve) => {
+            setTimeout(() => {
+              try { recorder.stop(); } catch {}
+              resolve();
+            }, 3800); // ~3.8s chunks
+          });
         }
-      };
-
-      // ensure we still flush occasionally (e.g., when page is backgrounded)
-      const flushTimer = setInterval(() => flush(), 1000);
-
-      try { recorder.start(1000); } catch (e) {
-        console.error("MediaRecorder start failed:", e);
-        setStatus("MediaRecorder start failed");
-        clearInterval(flushTimer);
-        stopRecording();
-        return;
       }
-
-      await new Promise((resolve) => {
-        recorder.onstop = () => {
-          clearInterval(flushTimer);
-          flush(); // send any final buffered audio
-          resolve();
-        };
-      });
-    }
 
 
 
