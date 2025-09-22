@@ -216,78 +216,65 @@
     }
 
     async function recordLoop(mimeType) {
-      while (recording) {
-        let recorder;
-        try {
-          recorder = new MediaRecorder(mediaStream, { mimeType });
-        } catch (e) {
-          console.error("Failed to create MediaRecorder:", e);
-          setStatus("Failed to create MediaRecorder");
-          stopRecording();
-          return;
-        }
-
-        // accumulate ~4s of audio; stop based on elapsed time OR pieces OR size
-        let chunks = [];
-        let bytes = 0;
-        const startedAt = performance.now();
-
-        const flush = async () => {
-          if (!chunks.length || socket?.readyState !== WebSocket.OPEN) return;
-          try {
-            const blob = new Blob(chunks, { type: chunks[0]?.type || mimeType });
-            const buf = await blob.arrayBuffer();
-            socket.send(buf);
-          } catch (err) {
-            console.warn("final flush error:", err);
-          } finally {
-            chunks = [];
-            bytes = 0;
-          }
-        };
-
-        recorder.ondataavailable = (e) => {
-          if (!e.data || e.data.size === 0) return;
-          chunks.push(e.data);
-          bytes += e.data.size;
-
-          const elapsed = performance.now() - startedAt;
-
-          // Stop when we have ~4s, OR enough callbacks, OR a "big enough" blob
-          if (
-            elapsed >= 3800 ||
-            chunks.length >= 4 ||
-            bytes >= 220_000 // safety for coalesced callbacks
-          ) {
-            // Defer stop out of the handler for robustness
-            queueMicrotask(() => {
-              if (recorder.state === "recording") {
-                try { recorder.stop(); } catch {}
-              }
-            });
-          }
-        };
-
-        recorder.onstop = async () => {
-          // send whatever we accumulated for this ~4s window
-          await flush();
-        };
-
-        try {
-          // 1s timeslice fires in background; we decide when to stop
-          recorder.start(1000);
-        } catch (e) {
-          console.error("MediaRecorder start failed:", e);
-          setStatus("MediaRecorder start failed");
-          stopRecording();
-          return;
-        }
-
-        // Wait until this short-lived recorder stops, then loop
-        await new Promise((resolve) => {
-          recorder.addEventListener("stop", resolve, { once: true });
-        });
+      let recorder;
+      try {
+        recorder = new MediaRecorder(mediaStream, { mimeType });
+      } catch (e) {
+        console.error("Failed to create MediaRecorder:", e);
+        setStatus("Failed to create MediaRecorder");
+        stopRecording();
+        return;
       }
+
+      let acc = [];
+      let accBytes = 0;
+      let lastFlush = performance.now();
+
+      async function flush(now = performance.now()) {
+        if (!acc.length || socket?.readyState !== WebSocket.OPEN) return;
+        try {
+          const blob = new Blob(acc, { type: acc[0]?.type || mimeType });
+          const buf = await blob.arrayBuffer();
+          socket.send(buf);
+        } catch (err) {
+          console.warn("send buffer error:", err);
+        } finally {
+          acc = [];
+          accBytes = 0;
+          lastFlush = now;
+        }
+      }
+
+      recorder.ondataavailable = (e) => {
+        if (!e.data || e.data.size === 0) return;
+        acc.push(e.data);
+        accBytes += e.data.size;
+
+        const now = performance.now();
+        // Flush roughly every ~3.8–4s, or if data got coalesced and is large
+        if (now - lastFlush >= 3800 || acc.length >= 4 || accBytes >= 220_000) {
+          // Defer flush out of the handler for robustness
+          queueMicrotask(() => flush(now));
+        }
+      };
+
+      try {
+        // 1s slices keep firing in background; we batch/flush ourselves
+        recorder.start(1000);
+      } catch (e) {
+        console.error("MediaRecorder start failed:", e);
+        setStatus("MediaRecorder start failed");
+        stopRecording();
+        return;
+      }
+
+      // Wait here until stopRecording() stops the tracks (which stops the recorder)
+      await new Promise((resolve) => {
+        recorder.addEventListener("stop", async () => {
+          await flush(); // send any remaining audio
+          resolve();
+        }, { once: true });
+      });
     }
 
 
