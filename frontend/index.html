@@ -226,41 +226,104 @@
         return;
       }
 
-      let acc = [];
-      let accBytes = 0;
-      let lastFlush = performance.now();
+      let chunks = [];
+      let totalBytes = 0;
+      let isFlushPending = false;
+      let flushTimer = null;
+      let forceDataTimer = null;
+      let lastSuccessfulSend = performance.now();
+      const TARGET_CHUNK_DURATION = 2000; // 2s chunks for lower latency
+      const MAX_CHUNK_DURATION = 4000;    // 4s max before force flush
+      const FORCE_DATA_INTERVAL = 1500;   // Force data extraction every 1.5s
 
-      async function flush(now = performance.now()) {
-        if (!acc.length || socket?.readyState !== WebSocket.OPEN) return;
+      // Unified flush function with mutex
+      async function flush(reason = "periodic") {
+        if (isFlushPending || !chunks.length) return;
+
+        // Check WebSocket state first
+        if (socket?.readyState !== WebSocket.OPEN) {
+          console.warn(`Flush skipped (${reason}): WebSocket not open`);
+          // Keep data for potential reconnection instead of discarding
+          return;
+        }
+
+        isFlushPending = true;
+        const chunksCopy = [...chunks];
+        const bytesCopy = totalBytes;
+
         try {
-          const blob = new Blob(acc, { type: acc[0]?.type || mimeType });
+          const blob = new Blob(chunksCopy, { type: chunksCopy[0]?.type || mimeType });
           const buf = await blob.arrayBuffer();
+
+          console.log(`Flushing ${chunksCopy.length} chunks (${bytesCopy} bytes) - reason: ${reason}`);
           socket.send(buf);
+
+          // Only clear on successful send
+          chunks = [];
+          totalBytes = 0;
+          lastSuccessfulSend = performance.now();
+
         } catch (err) {
-          console.warn("send buffer error:", err);
+          console.error("Failed to send audio:", err);
+          setStatus("Audio send error - retrying");
+          // Keep chunks for retry
         } finally {
-          acc = [];
-          accBytes = 0;
-          lastFlush = now;
+          isFlushPending = false;
         }
       }
 
+      // Schedule periodic flush
+      function scheduleFlush() {
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = setTimeout(() => {
+          flush("timer");
+          if (recording) scheduleFlush();
+        }, TARGET_CHUNK_DURATION);
+      }
+
+      // Data available handler
       recorder.ondataavailable = (e) => {
         if (!e.data || e.data.size === 0) return;
-        acc.push(e.data);
-        accBytes += e.data.size;
 
-        const now = performance.now();
-        // Flush roughly every ~3.8–4s, or if data got coalesced and is large
-        if (now - lastFlush >= 3800 || acc.length >= 4 || accBytes >= 220_000) {
-          // Defer flush out of the handler for robustness
-          queueMicrotask(() => flush(now));
+        chunks.push(e.data);
+        totalBytes += e.data.size;
+        console.log(`Data available: ${e.data.size} bytes (total: ${totalBytes})`);
+
+        // Immediate flush conditions
+        const timeSinceLastSend = performance.now() - lastSuccessfulSend;
+        if (totalBytes >= 150_000 || // 150KB threshold (lowered)
+            timeSinceLastSend >= MAX_CHUNK_DURATION) {
+          flush("threshold");
         }
       };
 
+      // Error handler
+      recorder.onerror = (e) => {
+        console.error("MediaRecorder error:", e);
+        setStatus("Recording error - restarting");
+      };
+
       try {
-        // 3.8s slices keep firing in background; we batch/flush ourselves
-        recorder.start(3800);
+        // Use shorter timeslice for more frequent data availability
+        recorder.start(500); // 500ms timeslice (more aggressive)
+        console.log("MediaRecorder started with 500ms timeslice");
+
+        // Start periodic flush timer
+        scheduleFlush();
+
+        // Periodically force data extraction if MediaRecorder is buffering
+        forceDataTimer = setInterval(() => {
+          if (recorder.state === "recording" && !isFlushPending) {
+            try {
+              // requestData() forces MediaRecorder to produce a data chunk
+              recorder.requestData();
+              console.log("Forced data request");
+            } catch (e) {
+              console.warn("requestData failed:", e);
+            }
+          }
+        }, FORCE_DATA_INTERVAL);
+
       } catch (e) {
         console.error("MediaRecorder start failed:", e);
         setStatus("MediaRecorder start failed");
@@ -268,10 +331,31 @@
         return;
       }
 
-      // Wait here until stopRecording() stops the tracks (which stops the recorder)
+      // Monitor for stalls
+      const stallMonitor = setInterval(() => {
+        const timeSinceLastSend = performance.now() - lastSuccessfulSend;
+        if (timeSinceLastSend > 8000 && recording) {
+          console.warn(`No successful sends for ${(timeSinceLastSend/1000).toFixed(1)}s`);
+          setStatus("Connection issue - check network");
+
+          // Force flush attempt
+          if (chunks.length > 0) {
+            flush("stall-recovery");
+          }
+        }
+      }, 2000);
+
+      // Cleanup on stop
       await new Promise((resolve) => {
         recorder.addEventListener("stop", async () => {
-          await flush(); // send any remaining audio
+          // Clear all timers
+          if (flushTimer) clearTimeout(flushTimer);
+          if (forceDataTimer) clearInterval(forceDataTimer);
+          clearInterval(stallMonitor);
+
+          // Final flush
+          await flush("final");
+          console.log("MediaRecorder stopped, final flush complete");
           resolve();
         }, { once: true });
       });
